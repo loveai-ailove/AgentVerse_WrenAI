@@ -1,14 +1,18 @@
 # WrenAI + AgentVerse 使用手册
 
-本文档面向这样的场景：
+本文档从一个新使用者第一次接手项目的角度编写，目标是帮助你完成下面这件事：
+
+- 基于已有的 MySQL 业务数据库安装 `WrenAI`
+- 手工创建并配置一个可运行的 Wren 项目
+- 启动 `ask_service` 提供自然语言问数接口
+- 在 `AgentVerse` 中通过 HTTP 节点接入该接口
+
+本文档默认前提如下：
 
 - MySQL 数据库已经存在
 - 数据库中已经有业务表和业务数据
-- 需要先单独部署 `WrenAI`
-- 再通过 `ask_service` 提供自然语言问数能力
-- 最后在 `AgentVerse` 中通过 HTTP 节点对接
-
-本文档的目标是：让使用者能够独立完成安装、配置、启动、测试和对接。
+- 不需要初始化测试数据
+- 只需要完成项目文件的创建、配置、启动和联调
 
 ## 1. 总体架构
 
@@ -35,58 +39,57 @@
 
 ## 2. 目录说明
 
-当前示例工程目录如下。每个节点后面都说明了：
+下面是示例工程目录。每个节点后面只保留一种状态说明：
 
-- 用途
-- 是否需要手工配置
-- 是否由执行命令自动生成
+- `手工创建`：表示需要你自己创建或维护
+- `命令生成`：表示执行命令后会自动出现
 
 ```text
-/home/lb/data/AgentVerse_WrenAI                    # 示例工程根目录；手工创建；不是命令自动生成
-├── README.md                                      # 使用手册；手工维护；不是命令自动生成
-├── .gitignore                                     # Git 忽略规则；建议手工创建；不是命令自动生成
-├── .env                                           # 本地 MySQL 容器环境变量；可选；手工配置；通常不入库
-├── .env.example                                   # MySQL 容器变量模板；建议手工创建并入库
-├── docker-compose.yml                             # 示例 MySQL 测试容器编排；可选；手工配置
-├── ask_service/                                   # 问数 HTTP 服务目录；手工创建；不是命令自动生成
-│   ├── .env                                       # ask_service 本地配置文件；必须手工配置；通常不入库
-│   ├── .env.example                               # ask_service 配置模板；建议手工创建并入库
-│   ├── app.py                                     # ask_service 主程序；必须手工创建/维护；不是命令自动生成
-│   ├── requirements.txt                           # ask_service 依赖清单；必须手工维护；不是命令自动生成
-│   └── systemd/                                   # systemd 部署文件目录；可选；手工创建
-│       └── ask-service.service                    # systemd 服务文件；可选；手工创建
-├── mysql-init/                                    # 示例初始化 SQL 目录；可选；手工创建
-│   └── 01_init_orders.sql                         # 示例 customers/orders 初始化脚本；可选；手工创建
-└── order-demo/                                    # WrenAI 项目目录；必须手工创建；不是命令自动生成
-    ├── connection_info.json                       # MySQL 连接配置；必须手工配置；通常不入库
-    ├── connection_info.example.json               # MySQL 连接模板；建议手工创建并入库
-    ├── wren_project.yml                           # Wren 项目主配置；必须手工配置；不是命令自动生成
-    ├── relationships.yml                          # 模型关系定义；通常必须手工配置；不是命令自动生成
-    ├── models/                                    # 模型定义目录；通常必须手工创建；不是命令自动生成
-    │   ├── customers/                             # 客户表模型目录；按业务表手工创建；不是命令自动生成
-    │   │   └── metadata.yml                       # customers 模型定义；必须手工配置；不是命令自动生成
-    │   └── orders/                                # 订单表模型目录；按业务表手工创建；不是命令自动生成
-    │       └── metadata.yml                       # orders 模型定义；必须手工配置；不是命令自动生成
-    ├── cubes/                                     # Cube 定义目录；可选；通常手工创建
-    │   └── order_metrics/                         # 示例订单统计 cube 目录；可选；手工创建
-    │       └── metadata.yml                       # cube 定义文件；可选；手工配置
-    ├── knowledge/                                 # 业务语义与示例问法目录；强烈建议创建；手工维护
-    │   ├── rules/                                 # 业务规则目录；强烈建议创建；手工维护
-    │   │   └── business-rules.md                  # 业务口径说明；强烈建议手工维护；不是命令自动生成
-    │   └── sql/                                   # 问法到 SQL 示例目录；强烈建议创建；手工维护
-    │       ├── revenue-by-member-level.md         # 示例问法与 SQL；可选但强烈建议；不是命令自动生成
-    │       └── revenue-by-status.md               # 示例问法与 SQL；可选但强烈建议；不是命令自动生成
-    ├── .wren/                                     # Wren 运行期目录；执行命令后自动生成
-    │   └── memory/                                # Memory 索引目录；执行 `wren memory index` 自动生成
-    └── target/                                    # 构建产物目录；执行命令后自动生成
-        └── mdl.json                               # 编译后的 MDL；执行 `wren context build` 自动生成
+/home/lb/data/AgentVerse_WrenAI                    # 项目根目录，统一放置 Wren 项目、ask_service 和文档；手工创建
+├── README.md                                      # 使用手册；手工创建
+├── .gitignore                                     # Git 忽略规则；手工创建
+├── .env                                           # 本地 MySQL 容器变量，仅在需要容器测试时使用；手工创建
+├── .env.example                                   # MySQL 容器变量模板；手工创建
+├── docker-compose.yml                             # 示例 MySQL 测试容器编排；手工创建
+├── ask_service/                                   # 问数 HTTP 服务目录；手工创建
+│   ├── .env                                       # ask_service 本地配置文件；手工创建
+│   ├── .env.example                               # ask_service 配置模板；手工创建
+│   ├── app.py                                     # ask_service 主程序；手工创建
+│   ├── requirements.txt                           # ask_service 依赖清单；手工创建
+│   └── systemd/                                   # systemd 部署文件目录；手工创建
+│       └── ask-service.service                    # systemd 服务文件；手工创建
+├── mysql-init/                                    # 示例初始化 SQL 目录，仅在你想本地造测试库时使用；手工创建
+│   └── 01_init_orders.sql                         # 示例初始化脚本；手工创建
+└── order-demo/                                    # WrenAI 项目目录；手工创建
+    ├── connection_info.json                       # MySQL 连接配置；手工创建
+    ├── connection_info.example.json               # MySQL 连接模板；手工创建
+    ├── wren_project.yml                           # Wren 项目主配置；手工创建
+    ├── relationships.yml                          # 模型关系定义；手工创建
+    ├── models/                                    # 模型定义目录；手工创建
+    │   ├── customers/                             # customers 表模型目录；手工创建
+    │   │   └── metadata.yml                       # customers 模型定义；手工创建
+    │   └── orders/                                # orders 表模型目录；手工创建
+    │       └── metadata.yml                       # orders 模型定义；手工创建
+    ├── cubes/                                     # Cube 定义目录；手工创建
+    │   └── order_metrics/                         # 示例订单统计 cube 目录；手工创建
+    │       └── metadata.yml                       # cube 定义文件；手工创建
+    ├── knowledge/                                 # 业务语义与示例问法目录；手工创建
+    │   ├── rules/                                 # 业务规则目录；手工创建
+    │   │   └── business-rules.md                  # 业务口径说明；手工创建
+    │   └── sql/                                   # 问法到 SQL 示例目录；手工创建
+    │       ├── revenue-by-member-level.md         # 示例问法与 SQL；手工创建
+    │       └── revenue-by-status.md               # 示例问法与 SQL；手工创建
+    ├── .wren/                                     # Wren 运行期目录；命令生成
+    │   └── memory/                                # Memory 索引目录；命令生成
+    └── target/                                    # 构建产物目录；命令生成
+        └── mdl.json                               # 编译后的 MDL；命令生成
 ```
 
 说明：
 
-- `order-demo/` 是 WrenAI 项目目录
-- `ask_service/` 是面向 AgentVerse 的问数服务
-- 本文档假设 MySQL 已经存在，因此不强制使用根目录下的 `docker-compose.yml`
+- `order-demo/` 是真正的 WrenAI 项目目录
+- `ask_service/` 是对外提供问数接口的服务目录
+- `.env`、`docker-compose.yml`、`mysql-init/` 只是辅助示例；如果你已经有业务 MySQL，可以不使用它们
 
 ## 3. 前置条件
 
@@ -114,41 +117,6 @@ sudo apt install -y \
   build-essential pkg-config default-libmysqlclient-dev \
   curl git
 ```
-
-## 3.1 推送到 GitHub 时的文件管理原则
-
-如果你计划把该项目推送到 GitHub，建议遵循下面的规则：
-
-**建议入库**
-
-- `README.md`
-- `.gitignore`
-- `.env.example`
-- `ask_service/.env.example`
-- `ask_service/app.py`
-- `ask_service/requirements.txt`
-- `order-demo/wren_project.yml`
-- `order-demo/relationships.yml`
-- `order-demo/connection_info.example.json`
-- `order-demo/models/`
-- `order-demo/cubes/`
-- `order-demo/knowledge/`
-
-**建议不要入库**
-
-- `.venv/`
-- `data/`
-- `.env`
-- `ask_service/.env`
-- `order-demo/connection_info.json`
-- `order-demo/.wren/`
-- `order-demo/target/`
-
-原因：
-
-- 这些文件要么包含真实密钥和密码
-- 要么属于运行时产物
-- 要么依赖本机环境，不适合代码管理
 
 ## 4. 基于 pip 安装 WrenAI
 
@@ -185,7 +153,17 @@ wren docs connection-info mysql
 
 ## 5. 手工创建和配置 WrenAI 项目
 
-本节演示如何手工创建一个 Wren 项目。示例使用两张表：
+本节演示如何基于“已经存在的业务 MySQL”手工创建一个 Wren 项目。
+
+这里不会初始化任何测试数据，只关注这些工作：
+
+- 创建目录
+- 创建配置文件
+- 创建模型文件
+- 创建关系文件
+- 创建可选的 cube 和 knowledge 文件
+
+为了方便说明，下面仍然使用两张示例表：
 
 - `customers`
 - `orders`
@@ -293,6 +271,8 @@ cp /home/lb/data/AgentVerse_WrenAI/order-demo/connection_info.example.json \
 
 建议给 Wren 单独创建只读账号。
 
+如果你接的是现有业务数据库，这一步是最先要完成的配置项之一。
+
 ### 5.3 创建项目主配置
 
 文件路径：
@@ -356,6 +336,14 @@ relationships:
     join_type: MANY_TO_ONE
     condition: orders.customer_id = customers.id
 ```
+
+如果你的业务表之间存在外键或稳定的主从关系，建议明确写进 `relationships.yml`。
+
+核心原则是：
+
+- 只写真实存在且业务含义明确的关系
+- 不要凭字段名臆造关系
+- 优先建模高频查询中会用到的关联关系
 
 ### 5.6 创建 cube 文件
 
@@ -582,6 +570,10 @@ wren memory index --mdl /home/lb/data/AgentVerse_WrenAI/order-demo/target/mdl.js
 - `order-demo/.wren/memory/`
 
 ### 5.10 手工验证 Wren 功能
+
+下面的 SQL 与 Cube 示例仍基于 `customers` 和 `orders` 两张演示表。
+
+如果你的业务数据库使用的是其他表，请把示例 SQL 改成你自己的表和字段。
 
 #### 基础 SQL 查询
 
@@ -1007,15 +999,17 @@ export HF_ENDPOINT=https://hf-mirror.com
 
 1. 安装 Python 依赖和 WrenAI
 2. 手工创建 `order-demo` 目录和配置文件
-3. 配置 MySQL 连接
-4. 执行 `wren context validate`
-5. 执行 `wren context build`
-6. 执行 `wren memory index`
-7. 手工验证 `wren --sql`、`wren cube query`
-8. 配置并启动 `ask_service`
-9. 测试 `/health`、`/status`、`/api/ask`
-10. 在 AgentVerse 工作流中配置 HTTP 节点
-11. 用真实自然语言问题进行回归测试
+3. 配置已有业务 MySQL 的连接信息
+4. 根据你的业务表编写 `models/` 和 `relationships.yml`
+5. 按需补充 `cubes/`、`knowledge/rules/`、`knowledge/sql/`
+6. 执行 `wren context validate`
+7. 执行 `wren context build`
+8. 执行 `wren memory index`
+9. 手工验证 `wren --sql`、`wren cube query`
+10. 配置并启动 `ask_service`
+11. 测试 `/health`、`/status`、`/api/ask`
+12. 在 AgentVerse 工作流中配置 HTTP 节点
+13. 用真实自然语言问题进行回归测试
 
 ## 10. 后续优化建议
 
