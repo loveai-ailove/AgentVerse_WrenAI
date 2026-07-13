@@ -1,0 +1,88 @@
+name: orders
+table_reference:
+  schema: wren_demo
+  table: orders
+properties:
+  description: 商品订单事实表，一行代表一笔订单，通过 customer_id 关联 customers.id。
+columns:
+  - name: id
+    type: INTEGER
+    is_calculated: false
+    not_null: true
+    is_primary_key: true
+    properties:
+      description: 订单主键 ID
+  - name: order_no
+    type: VARCHAR
+    is_calculated: false
+    not_null: true
+    properties:
+      description: 订单编号
+  - name: customer_id
+    type: INTEGER
+    is_calculated: false
+    not_null: true
+    properties:
+      description: 客户 ID，关联 customers.id
+  - name: product_name
+    type: VARCHAR
+    is_calculated: false
+    not_null: true
+    properties:
+      description: 商品名称
+  - name: product_category
+    type: VARCHAR
+    is_calculated: false
+    not_null: true
+    properties:
+      description: 商品品类
+  - name: unit_price
+    type: DOUBLE
+    is_calculated: false
+    not_null: true
+    properties:
+      description: 商品单价
+  - name: quantity
+    type: INTEGER
+    is_calculated: false
+    not_null: true
+    properties:
+      description: 购买数量
+  - name: total_amount
+    type: DOUBLE
+    is_calculated: false
+    not_null: true
+    properties:
+      description: 订单总金额
+  - name: order_status
+    type: VARCHAR
+    is_calculated: false
+    not_null: true
+    properties:
+      description: 订单状态，取值包括 PAID、SHIPPED、COMPLETED、CANCELLED、REFUNDED
+  - name: payment_method
+    type: VARCHAR
+    is_calculated: false
+    not_null: true
+    properties:
+      description: 支付方式，取值包括 ALIPAY、WECHAT、BANKCARD
+  - name: region
+    type: VARCHAR
+    is_calculated: false
+    not_null: true
+    properties:
+      description: 订单归属地区
+  - name: created_at
+    type: TIMESTAMP
+    is_calculated: false
+    not_null: true
+    properties:
+      description: 下单时间
+  - name: paid_at
+    type: TIMESTAMP
+    is_calculated: false
+    not_null: false
+    properties:
+      description: 支付时间；取消订单可能为空
+primary_key: id
+cached: false

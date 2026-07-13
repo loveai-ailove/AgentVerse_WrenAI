@@ -1,0 +1,31 @@
+name: order_metrics
+base_object: orders
+measures:
+  - name: total_revenue
+    expression: SUM(total_amount)
+    type: DOUBLE
+  - name: order_count
+    expression: COUNT(*)
+    type: BIGINT
+  - name: avg_order_amount
+    expression: AVG(total_amount)
+    type: DOUBLE
+dimensions:
+  - name: product_category
+    expression: product_category
+    type: VARCHAR
+  - name: order_status
+    expression: order_status
+    type: VARCHAR
+  - name: payment_method
+    expression: payment_method
+    type: VARCHAR
+  - name: region
+    expression: region
+    type: VARCHAR
+time_dimensions:
+  - name: created_at
+    expression: created_at
+    type: TIMESTAMP
+properties:
+  description: 商品订单的收入、订单量和客单价统计立方体。

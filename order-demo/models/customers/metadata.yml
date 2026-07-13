@@ -1,0 +1,70 @@
+name: customers
+table_reference:
+  schema: wren_demo
+  table: customers
+properties:
+  description: 客户主数据表，一行代表一个客户，包含地区、会员等级和注册时间等信息。
+columns:
+  - name: id
+    type: INTEGER
+    is_calculated: false
+    not_null: true
+    is_primary_key: true
+    properties:
+      description: 客户主键 ID
+  - name: customer_no
+    type: VARCHAR
+    is_calculated: false
+    not_null: true
+    properties:
+      description: 客户编号
+  - name: customer_name
+    type: VARCHAR
+    is_calculated: false
+    not_null: true
+    properties:
+      description: 客户姓名
+  - name: gender
+    type: VARCHAR
+    is_calculated: false
+    not_null: false
+    properties:
+      description: 性别
+  - name: mobile
+    type: VARCHAR
+    is_calculated: false
+    not_null: false
+    properties:
+      description: 手机号
+  - name: email
+    type: VARCHAR
+    is_calculated: false
+    not_null: false
+    properties:
+      description: 邮箱
+  - name: city
+    type: VARCHAR
+    is_calculated: false
+    not_null: true
+    properties:
+      description: 城市
+  - name: region
+    type: VARCHAR
+    is_calculated: false
+    not_null: true
+    properties:
+      description: 客户所属地区
+  - name: member_level
+    type: VARCHAR
+    is_calculated: false
+    not_null: true
+    properties:
+      description: 会员等级，取值包括 SILVER、GOLD、PLATINUM
+  - name: registered_at
+    type: TIMESTAMP
+    is_calculated: false
+    not_null: true
+    properties:
+      description: 注册时间
+primary_key: id
+cached: false
