@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import json
 import logging
 import os
@@ -9,7 +10,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 import sqlparse
 from dotenv import load_dotenv
@@ -32,6 +33,8 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
+
+T = TypeVar("T")
 
 SERVICE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SERVICE_DIR.parent
@@ -69,6 +72,8 @@ class AskResponse(BaseModel):
 
 class AskRuntime:
     def __init__(self) -> None:
+        self.ask_host = os.getenv("ASK_HOST", "127.0.0.1")
+        self.ask_port = int(os.getenv("ASK_PORT", "18082"))
         self.vllm_base_url = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1")
         self.vllm_api_key = os.getenv("VLLM_API_KEY", "dummy")
         self.vllm_model = os.getenv("VLLM_MODEL", "qwen2.5-7b-instruct")
@@ -89,6 +94,9 @@ class AskRuntime:
         self.conn_dict: dict[str, Any] = {}
         self.data_source: DataSource | None = None
         self.config = WrenConfig(strict_mode=self.strict_mode)
+        self._memory_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._memory_store_future: concurrent.futures.Future[MemoryStore] | None = None
+        self._memory_init_error: str | None = None
         self._manifest_dict: dict[str, Any] | None = None
         self._manifest_b64: str | None = None
         self._manifest_mtime_ns: int | None = None
@@ -120,23 +128,23 @@ class AskRuntime:
             elapsed_ms=int((time.perf_counter() - conn_started) * 1000),
         )
 
-        memory_started = time.perf_counter()
-        self.memory_store = MemoryStore(path=self.memory_path)
+        self._start_memory_store_init()
         log_event(
-            "startup_memory_ready",
+            "startup_memory_init_submitted",
             memory_path=str(self.memory_path),
-            elapsed_ms=int((time.perf_counter() - memory_started) * 1000),
         )
 
         llm_started = time.perf_counter()
         self.llm_client = OpenAI(
             base_url=self.vllm_base_url,
             api_key=self.vllm_api_key,
+            timeout=self.query_timeout_sec,
         )
         log_event(
             "startup_llm_client_ready",
             vllm_base_url=self.vllm_base_url,
             vllm_model=self.vllm_model,
+            query_timeout_sec=self.query_timeout_sec,
             elapsed_ms=int((time.perf_counter() - llm_started) * 1000),
         )
 
@@ -172,10 +180,17 @@ class AskRuntime:
         log_event("shutdown_begin")
         self.memory_store = None
         self.llm_client = None
+        if self._memory_executor is not None:
+            self._memory_executor.shutdown(wait=False, cancel_futures=True)
+        self._memory_executor = None
+        self._memory_store_future = None
         log_event("shutdown_completed")
 
     def status(self) -> dict[str, Any]:
+        self._sync_memory_store_state()
         return {
+            "ask_host": self.ask_host,
+            "ask_port": self.ask_port,
             "project_path": str(self.project_path),
             "mdl_path": str(self.mdl_path),
             "conn_file": str(self.conn_file),
@@ -183,6 +198,9 @@ class AskRuntime:
             "vllm_base_url": self.vllm_base_url,
             "vllm_model": self.vllm_model,
             "strict_mode": self.config.strict_mode,
+            "query_timeout_sec": self.query_timeout_sec,
+            "memory_state": self._memory_state(),
+            "memory_init_error": self._memory_init_error,
             "memory_tables": self.memory_store.status() if self.memory_store else {},
         }
 
@@ -207,10 +225,10 @@ class AskRuntime:
 
     def reindex(self) -> dict[str, Any]:
         manifest, _ = self._load_manifest(force=True)
-        assert self.memory_store is not None
-        schema_result = self.memory_store.index_schema(manifest, seed_queries=True)
+        memory_store = self.require_memory_store()
+        schema_result = memory_store.index_schema(manifest, seed_queries=True)
         md_pairs = load_query_pairs(self.project_path)
-        query_result = self.memory_store.load_queries(md_pairs, upsert=True) if md_pairs else {}
+        query_result = memory_store.load_queries(md_pairs, upsert=True) if md_pairs else {}
         return {
             "schema_result": schema_result,
             "query_result": query_result,
@@ -240,6 +258,59 @@ class AskRuntime:
             raise RuntimeError(f"连接配置必须是 JSON Object: {path}")
         return self._normalize_conn(raw)
 
+    def _start_memory_store_init(self) -> None:
+        if self.memory_store is not None or self._memory_store_future is not None:
+            return
+        self._memory_init_error = None
+        self._memory_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="memory-store-init",
+        )
+        self._memory_store_future = self._memory_executor.submit(self._build_memory_store)
+
+    def _build_memory_store(self) -> MemoryStore:
+        memory_started = time.perf_counter()
+        store = MemoryStore(path=self.memory_path)
+        log_event(
+            "startup_memory_ready",
+            memory_path=str(self.memory_path),
+            elapsed_ms=int((time.perf_counter() - memory_started) * 1000),
+        )
+        return store
+
+    def _sync_memory_store_state(self) -> None:
+        if self.memory_store is not None or self._memory_store_future is None:
+            return
+        if not self._memory_store_future.done():
+            return
+        try:
+            self.memory_store = self._memory_store_future.result()
+        except Exception as exc:
+            self._memory_init_error = str(exc)
+            log_event("startup_memory_failed", memory_path=str(self.memory_path), error=str(exc))
+        finally:
+            self._memory_store_future = None
+            if self._memory_executor is not None:
+                self._memory_executor.shutdown(wait=False, cancel_futures=True)
+                self._memory_executor = None
+
+    def _memory_state(self) -> str:
+        if self.memory_store is not None:
+            return "ready"
+        if self._memory_init_error:
+            return "error"
+        if self._memory_store_future is not None:
+            return "warming_up"
+        return "not_started"
+
+    def require_memory_store(self) -> MemoryStore:
+        self._sync_memory_store_state()
+        if self.memory_store is not None:
+            return self.memory_store
+        if self._memory_init_error:
+            raise MemoryStoreNotReadyError(f"MemoryStore 初始化失败: {self._memory_init_error}")
+        raise MemoryStoreNotReadyError("MemoryStore 仍在预热，请稍后重试")
+
     @staticmethod
     def _resolve_path(value: str) -> Path:
         path = Path(value).expanduser()
@@ -249,6 +320,18 @@ class AskRuntime:
 
 
 runtime = AskRuntime()
+
+
+class RequestTimeoutError(TimeoutError):
+    pass
+
+
+class SQLTimeoutError(TimeoutError):
+    pass
+
+
+class MemoryStoreNotReadyError(RuntimeError):
+    pass
 
 
 def json_dumps(value: Any) -> str:
@@ -413,17 +496,53 @@ def normalize_chart(chart: Any) -> dict[str, Any]:
     }
 
 
-def llm_chat(messages: list[dict[str, str]], *, temperature: float = 0.1) -> str:
+def remaining_timeout_seconds(deadline: float | None) -> float:
+    if deadline is None:
+        return float(runtime.query_timeout_sec)
+    remaining = deadline - time.perf_counter()
+    if remaining <= 0:
+        raise RequestTimeoutError("问数请求整体超时")
+    return max(0.1, remaining)
+
+
+def run_with_timeout(
+    func: Callable[..., T],
+    *args: Any,
+    timeout_sec: float,
+    timeout_exc: type[Exception],
+    timeout_message: str,
+    **kwargs: Any,
+) -> T:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(func, *args, **kwargs)
+        try:
+            return future.result(timeout=timeout_sec)
+        except concurrent.futures.TimeoutError as exc:
+            future.cancel()
+            raise timeout_exc(timeout_message) from exc
+
+
+def llm_chat(
+    messages: list[dict[str, str]],
+    *,
+    temperature: float = 0.1,
+    timeout_sec: float | None = None,
+) -> str:
     assert runtime.llm_client is not None
     response = runtime.llm_client.chat.completions.create(
         model=runtime.vllm_model,
         temperature=temperature,
         messages=messages,
+        timeout=timeout_sec or float(runtime.query_timeout_sec),
     )
     return (response.choices[0].message.content or "").strip()
 
 
-def repair_json_with_llm(raw_text: str) -> dict[str, Any] | None:
+def repair_json_with_llm(
+    raw_text: str,
+    *,
+    timeout_sec: float | None = None,
+) -> dict[str, Any] | None:
     repaired = llm_chat(
         [
             {
@@ -436,11 +555,16 @@ def repair_json_with_llm(raw_text: str) -> dict[str, Any] | None:
             {"role": "user", "content": raw_text},
         ],
         temperature=0.0,
+        timeout_sec=timeout_sec,
     )
     return parse_json_candidate(repaired)
 
 
-def parse_plan_response(raw_text: str) -> dict[str, Any]:
+def parse_plan_response(
+    raw_text: str,
+    *,
+    timeout_sec: float | None = None,
+) -> dict[str, Any]:
     parsed = parse_json_candidate(raw_text)
     if parsed is not None:
         return parsed
@@ -454,7 +578,7 @@ def parse_plan_response(raw_text: str) -> dict[str, Any]:
             "chart": {"type": "table", "xField": "", "yField": ""},
         }
 
-    repaired = repair_json_with_llm(cleaned)
+    repaired = repair_json_with_llm(cleaned, timeout_sec=timeout_sec)
     if repaired is not None:
         return repaired
 
@@ -529,6 +653,7 @@ def llm_plan(
     recalls: list[dict[str, Any]],
     fetched: dict[str, Any],
     allowed_regions: list[str],
+    timeout_sec: float | None = None,
 ) -> dict[str, Any]:
     raw_text = llm_chat(
         [
@@ -547,11 +672,18 @@ def llm_plan(
             },
         ],
         temperature=0.1,
+        timeout_sec=timeout_sec,
     )
-    return parse_plan_response(raw_text)
+    return parse_plan_response(raw_text, timeout_sec=timeout_sec)
 
 
-def llm_summary(question: str, sql: str, rows: list[dict[str, Any]]) -> str:
+def llm_summary(
+    question: str,
+    sql: str,
+    rows: list[dict[str, Any]],
+    *,
+    timeout_sec: float | None = None,
+) -> str:
     return llm_chat(
         [
             {
@@ -564,14 +696,25 @@ def llm_summary(question: str, sql: str, rows: list[dict[str, Any]]) -> str:
             },
         ],
         temperature=0.2,
+        timeout_sec=timeout_sec,
     )
 
 
-def execute_sql(sql: str) -> list[dict[str, Any]]:
-    started = time.perf_counter()
+def _query_sql(sql: str) -> list[dict[str, Any]]:
     with runtime.build_engine() as engine:
         table = engine.query(sql, limit=runtime.max_result_rows)
-    rows = table.to_pylist()
+    return table.to_pylist()
+
+
+def execute_sql(sql: str, *, timeout_sec: float) -> list[dict[str, Any]]:
+    started = time.perf_counter()
+    rows = run_with_timeout(
+        _query_sql,
+        sql,
+        timeout_sec=timeout_sec,
+        timeout_exc=SQLTimeoutError,
+        timeout_message="SQL 执行超时",
+    )
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     log_event(
         "sql_query_finished",
@@ -582,10 +725,20 @@ def execute_sql(sql: str) -> list[dict[str, Any]]:
     return rows
 
 
-def dry_run_sql(sql: str) -> None:
-    started = time.perf_counter()
+def _dry_run_sql(sql: str) -> None:
     with runtime.build_engine() as engine:
         engine.dry_run(sql)
+
+
+def dry_run_sql(sql: str, *, timeout_sec: float) -> None:
+    started = time.perf_counter()
+    run_with_timeout(
+        _dry_run_sql,
+        sql,
+        timeout_sec=timeout_sec,
+        timeout_exc=SQLTimeoutError,
+        timeout_message="SQL 预检查超时",
+    )
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     log_event(
         "sql_dry_run_finished",
@@ -595,8 +748,14 @@ def dry_run_sql(sql: str) -> None:
 
 
 def classify_exception(exc: Exception) -> ErrorInfo:
+    if isinstance(exc, MemoryStoreNotReadyError):
+        return ErrorInfo(code="MEMORY_WARMING_UP", message=str(exc))
     if isinstance(exc, ValueError):
         return ErrorInfo(code="BAD_PLAN", message=str(exc))
+    if isinstance(exc, RequestTimeoutError):
+        return ErrorInfo(code="REQUEST_TIMEOUT", message=str(exc))
+    if isinstance(exc, SQLTimeoutError):
+        return ErrorInfo(code="SQL_TIMEOUT", message=str(exc))
     if isinstance(exc, (APITimeoutError, TimeoutError)):
         return ErrorInfo(code="LLM_TIMEOUT", message="大模型响应超时")
     if isinstance(exc, BadRequestError):
@@ -604,6 +763,18 @@ def classify_exception(exc: Exception) -> ErrorInfo:
     if isinstance(exc, OpenAIAPIError):
         return ErrorInfo(code="LLM_API_ERROR", message=str(exc))
     return ErrorInfo(code="INTERNAL_ERROR", message=str(exc))
+
+
+def status_code_for_exception(exc: Exception) -> int:
+    if isinstance(exc, MemoryStoreNotReadyError):
+        return 503
+    if isinstance(exc, ValueError):
+        return 400
+    if isinstance(exc, (RequestTimeoutError, SQLTimeoutError, APITimeoutError, TimeoutError)):
+        return 504
+    if isinstance(exc, (BadRequestError, OpenAIAPIError)):
+        return 503
+    return 500
 
 
 @asynccontextmanager
@@ -621,12 +792,15 @@ def health() -> dict[str, Any]:
     return {
         "ok": True,
         "service": "ask_service",
+        "ask_host": runtime.ask_host,
+        "ask_port": runtime.ask_port,
         "project_path": str(runtime.project_path),
         "mdl_path": str(runtime.mdl_path),
         "memory_path": str(runtime.memory_path),
         "vllm_base_url": runtime.vllm_base_url,
         "vllm_model": runtime.vllm_model,
         "strict_mode": runtime.config.strict_mode,
+        "query_timeout_sec": runtime.query_timeout_sec,
     }
 
 
@@ -636,17 +810,25 @@ def status() -> dict[str, Any]:
 
 
 @app.post("/admin/reindex")
-def reindex() -> dict[str, Any]:
-    return {
-        "ok": True,
-        **runtime.reindex(),
-    }
+def reindex() -> Any:
+    try:
+        return {
+            "ok": True,
+            **runtime.reindex(),
+        }
+    except Exception as exc:  # noqa: BLE001
+        status_code = status_code_for_exception(exc)
+        return JSONResponse(
+            status_code=status_code,
+            content={"ok": False, "error": classify_exception(exc).model_dump()},
+        )
 
 
 @app.post("/api/ask", response_model=AskResponse)
 def ask(req: AskRequest) -> AskResponse:
     trace_id = uuid.uuid4().hex[:16]
     start = time.time()
+    deadline = time.perf_counter() + runtime.query_timeout_sec
 
     try:
         if not req.question.strip():
@@ -661,15 +843,15 @@ def ask(req: AskRequest) -> AskResponse:
             fetch_limit=req.fetch_limit or runtime.default_fetch_limit,
         )
 
-        assert runtime.memory_store is not None
+        memory_store = runtime.require_memory_store()
         recall_started = time.perf_counter()
         manifest, _ = runtime.current_manifest()
 
-        recalls = runtime.memory_store.recall_queries(
+        recalls = memory_store.recall_queries(
             req.question,
             limit=req.recall_limit or runtime.default_recall_limit,
         )
-        fetched = runtime.memory_store.get_context(
+        fetched = memory_store.get_context(
             manifest,
             req.question,
             limit=req.fetch_limit or runtime.default_fetch_limit,
@@ -691,6 +873,7 @@ def ask(req: AskRequest) -> AskResponse:
             recalls=recalls,
             fetched=fetched,
             allowed_regions=req.allowed_regions,
+            timeout_sec=remaining_timeout_seconds(deadline),
         )
         log_event(
             "ask_plan_ready",
@@ -724,10 +907,15 @@ def ask(req: AskRequest) -> AskResponse:
             )
 
         sql = ensure_safe_sql(str(plan.get("sql", "")))
-        dry_run_sql(sql)
-        rows = execute_sql(sql)
+        dry_run_sql(sql, timeout_sec=remaining_timeout_seconds(deadline))
+        rows = execute_sql(sql, timeout_sec=remaining_timeout_seconds(deadline))
         summary_started = time.perf_counter()
-        summary = llm_summary(req.question, sql, rows)
+        summary = llm_summary(
+            req.question,
+            sql,
+            rows,
+            timeout_sec=remaining_timeout_seconds(deadline),
+        )
         summary_elapsed_ms = int((time.perf_counter() - summary_started) * 1000)
 
         latency_ms = int((time.time() - start) * 1000)
@@ -753,6 +941,7 @@ def ask(req: AskRequest) -> AskResponse:
     except Exception as exc:  # noqa: BLE001
         latency_ms = int((time.time() - start) * 1000)
         error = classify_exception(exc)
+        status_code = status_code_for_exception(exc)
         LOGGER.exception("trace_id=%s ask failed", trace_id)
         log_event(
             "ask_request_failed",
@@ -760,6 +949,7 @@ def ask(req: AskRequest) -> AskResponse:
             latency_ms=latency_ms,
             error_code=error.code,
             error_message=error.message,
+            status_code=status_code,
         )
         response = make_response(
             ok=False,
@@ -769,4 +959,4 @@ def ask(req: AskRequest) -> AskResponse:
             summary="当前问数服务暂时不可用，请稍后重试，或换一种更明确的问法。",
             error=error,
         )
-        return JSONResponse(status_code=200, content=jsonable_encoder(response))
+        return JSONResponse(status_code=status_code, content=jsonable_encoder(response))

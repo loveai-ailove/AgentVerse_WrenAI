@@ -724,12 +724,13 @@ curl http://127.0.0.1:8000/v1/models
 ```bash
 source /home/lb/data/AgentVerse_WrenAI/.venv/bin/activate
 cd /home/lb/data/AgentVerse_WrenAI/ask_service
-uvicorn app:app --host 127.0.0.1 --port 18082 --workers 1
+python main.py
 ```
 
 说明：
 
-- `--workers 1` 不要改大
+- 启动入口会读取 `ask_service/.env` 中的 `ASK_HOST` 与 `ASK_PORT`
+- `workers` 固定为 `1`，不要改大
 - 首次启动如果卡在 `Waiting for application startup`，通常是 `MemoryStore` 首次加载模型
 
 服务主文件：
@@ -845,7 +846,7 @@ curl -X POST http://127.0.0.1:18082/api/ask \
 
 - `http://127.0.0.1:18082/api/ask`
 
-这里假设你后续已经允许 HTTP 节点访问本地地址。
+当前项目已放开 AgentVerse HTTP 节点对本地地址的访问限制，因此可以直接调用本机地址。
 
 ### 7.2 推荐工作流结构
 

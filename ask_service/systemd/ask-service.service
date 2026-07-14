@@ -8,7 +8,7 @@ User=lb
 WorkingDirectory=/home/lb/data/AgentVerse_WrenAI/ask_service
 EnvironmentFile=/home/lb/data/AgentVerse_WrenAI/ask_service/.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/lb/data/AgentVerse_WrenAI/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 18082 --workers 1
+ExecStart=/home/lb/data/AgentVerse_WrenAI/.venv/bin/python /home/lb/data/AgentVerse_WrenAI/ask_service/main.py
 Restart=always
 RestartSec=3
 
