@@ -6,9 +6,11 @@ import json
 import logging
 import os
 import re
+import subprocess
+import sys
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
@@ -77,6 +79,17 @@ class AskRuntime:
         self.vllm_base_url = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1")
         self.vllm_api_key = os.getenv("VLLM_API_KEY", "dummy")
         self.vllm_model = os.getenv("VLLM_MODEL", "qwen2.5-7b-instruct")
+        self.embedding_model = os.getenv(
+            "WREN_EMBEDDING_MODEL", "paraphrase-multilingual-MiniLM-L12-v2"
+        ).strip()
+        self.embedding_model_local_path = self._resolve_embedding_model_local_path(
+            os.getenv("WREN_EMBEDDING_MODEL_LOCAL_PATH", "").strip(),
+            self.embedding_model,
+        )
+        self.memory_model_name = self.embedding_model_local_path or self.embedding_model
+        self.memory_model_source = (
+            "local_path" if self.embedding_model_local_path else "model_name"
+        )
 
         self.project_path = self._resolve_path(os.environ["WREN_PROJECT_PATH"])
         self.mdl_path = self._resolve_path(os.environ["WREN_MDL_PATH"])
@@ -94,8 +107,7 @@ class AskRuntime:
         self.conn_dict: dict[str, Any] = {}
         self.data_source: DataSource | None = None
         self.config = WrenConfig(strict_mode=self.strict_mode)
-        self._memory_executor: concurrent.futures.ThreadPoolExecutor | None = None
-        self._memory_store_future: concurrent.futures.Future[MemoryStore] | None = None
+        self._memory_warmup_process: subprocess.Popen[str] | None = None
         self._memory_init_error: str | None = None
         self._manifest_dict: dict[str, Any] | None = None
         self._manifest_b64: str | None = None
@@ -128,10 +140,13 @@ class AskRuntime:
             elapsed_ms=int((time.perf_counter() - conn_started) * 1000),
         )
 
-        self._start_memory_store_init()
+        warmup_pid = self._start_memory_store_init()
         log_event(
             "startup_memory_init_submitted",
             memory_path=str(self.memory_path),
+            warmup_pid=warmup_pid,
+            embedding_model=self.memory_model_name,
+            embedding_model_source=self.memory_model_source,
         )
 
         llm_started = time.perf_counter()
@@ -180,10 +195,7 @@ class AskRuntime:
         log_event("shutdown_begin")
         self.memory_store = None
         self.llm_client = None
-        if self._memory_executor is not None:
-            self._memory_executor.shutdown(wait=False, cancel_futures=True)
-        self._memory_executor = None
-        self._memory_store_future = None
+        self._stop_memory_warmup_process()
         log_event("shutdown_completed")
 
     def status(self) -> dict[str, Any]:
@@ -197,6 +209,9 @@ class AskRuntime:
             "memory_path": str(self.memory_path),
             "vllm_base_url": self.vllm_base_url,
             "vllm_model": self.vllm_model,
+            "embedding_model": self.embedding_model,
+            "embedding_model_source": self.memory_model_source,
+            "embedding_model_resolved": self.memory_model_name,
             "strict_mode": self.config.strict_mode,
             "query_timeout_sec": self.query_timeout_sec,
             "memory_state": self._memory_state(),
@@ -258,48 +273,71 @@ class AskRuntime:
             raise RuntimeError(f"连接配置必须是 JSON Object: {path}")
         return self._normalize_conn(raw)
 
-    def _start_memory_store_init(self) -> None:
-        if self.memory_store is not None or self._memory_store_future is not None:
-            return
+    def _start_memory_store_init(self) -> int | None:
+        if self.memory_store is not None or self._memory_warmup_process is not None:
+            return self._memory_warmup_process.pid if self._memory_warmup_process else None
         self._memory_init_error = None
-        self._memory_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="memory-store-init",
+        worker_script = SERVICE_DIR / "memory_warmup_worker.py"
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        self._memory_warmup_process = subprocess.Popen(
+            [
+                sys.executable,
+                str(worker_script),
+                str(self.memory_path),
+                self.memory_model_name,
+            ],
+            cwd=str(SERVICE_DIR),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-        self._memory_store_future = self._memory_executor.submit(self._build_memory_store)
+        return self._memory_warmup_process.pid
 
     def _build_memory_store(self) -> MemoryStore:
         memory_started = time.perf_counter()
-        store = MemoryStore(path=self.memory_path)
+        store = MemoryStore(path=self.memory_path, model_name=self.memory_model_name)
         log_event(
             "startup_memory_ready",
             memory_path=str(self.memory_path),
             elapsed_ms=int((time.perf_counter() - memory_started) * 1000),
+            phase="parent_attach",
+            embedding_model=self.memory_model_name,
         )
         return store
 
     def _sync_memory_store_state(self) -> None:
-        if self.memory_store is not None or self._memory_store_future is None:
+        if self.memory_store is not None or self._memory_warmup_process is None:
             return
-        if not self._memory_store_future.done():
+        process = self._memory_warmup_process
+        return_code = process.poll()
+        if return_code is None:
             return
+        stdout, stderr = process.communicate()
+        self._memory_warmup_process = None
         try:
-            self.memory_store = self._memory_store_future.result()
+            if return_code != 0:
+                error_text = stderr.strip() or stdout.strip() or f"预热子进程退出码异常: {return_code}"
+                raise RuntimeError(error_text)
+            log_event(
+                "startup_memory_warmup_completed",
+                memory_path=str(self.memory_path),
+                warmup_pid=process.pid,
+                worker_output=shorten_text(stdout.strip(), 200) if stdout.strip() else "",
+            )
+            self.memory_store = self._build_memory_store()
+            self._memory_init_error = None
         except Exception as exc:
             self._memory_init_error = str(exc)
             log_event("startup_memory_failed", memory_path=str(self.memory_path), error=str(exc))
-        finally:
-            self._memory_store_future = None
-            if self._memory_executor is not None:
-                self._memory_executor.shutdown(wait=False, cancel_futures=True)
-                self._memory_executor = None
 
     def _memory_state(self) -> str:
         if self.memory_store is not None:
             return "ready"
         if self._memory_init_error:
             return "error"
-        if self._memory_store_future is not None:
+        if self._memory_warmup_process is not None:
             return "warming_up"
         return "not_started"
 
@@ -310,6 +348,95 @@ class AskRuntime:
         if self._memory_init_error:
             raise MemoryStoreNotReadyError(f"MemoryStore 初始化失败: {self._memory_init_error}")
         raise MemoryStoreNotReadyError("MemoryStore 仍在预热，请稍后重试")
+
+    def _resolve_embedding_model_local_path(
+        self,
+        configured_local_path: str,
+        embedding_model: str,
+    ) -> str | None:
+        if configured_local_path:
+            resolved = self._resolve_path(configured_local_path)
+            if not resolved.exists():
+                raise RuntimeError(f"本地 embedding 模型目录不存在: {resolved}")
+            return str(resolved)
+
+        configured_model_path = self._resolve_maybe_local_path(embedding_model)
+        if configured_model_path is not None:
+            return configured_model_path
+
+        return self._find_hf_snapshot_path(embedding_model)
+
+    def _resolve_maybe_local_path(self, value: str) -> str | None:
+        if not value:
+            return None
+        if not (
+            value.startswith("/")
+            or value.startswith("./")
+            or value.startswith("../")
+            or value.startswith("~/")
+        ):
+            return None
+        resolved = self._resolve_path(value)
+        if not resolved.exists():
+            raise RuntimeError(f"embedding 模型路径不存在: {resolved}")
+        return str(resolved)
+
+    def _find_hf_snapshot_path(self, embedding_model: str) -> str | None:
+        hf_home = Path(
+            os.getenv(
+                "HF_HOME",
+                os.getenv("HUGGINGFACE_HUB_CACHE", str(Path.home() / ".cache" / "huggingface")),
+            )
+        ).expanduser()
+        hub_root = hf_home / "hub"
+        candidate_repo_ids = [embedding_model]
+        if "/" not in embedding_model:
+            candidate_repo_ids.append(f"sentence-transformers/{embedding_model}")
+
+        for repo_id in candidate_repo_ids:
+            repo_dir = hub_root / f"models--{repo_id.replace('/', '--')}"
+            snapshot = self._select_snapshot_dir(repo_dir)
+            if snapshot is not None:
+                return str(snapshot)
+        return None
+
+    @staticmethod
+    def _select_snapshot_dir(repo_dir: Path) -> Path | None:
+        snapshots_dir = repo_dir / "snapshots"
+        if not snapshots_dir.exists():
+            return None
+
+        refs_main = repo_dir / "refs" / "main"
+        if refs_main.exists():
+            revision = refs_main.read_text(encoding="utf-8").strip()
+            if revision:
+                snapshot = snapshots_dir / revision
+                if snapshot.exists():
+                    return snapshot
+
+        snapshots = [path for path in snapshots_dir.iterdir() if path.is_dir()]
+        if not snapshots:
+            return None
+        snapshots.sort(key=lambda item: item.stat().st_mtime_ns, reverse=True)
+        return snapshots[0]
+
+    def _stop_memory_warmup_process(self) -> None:
+        process = self._memory_warmup_process
+        self._memory_warmup_process = None
+        if process is None:
+            return
+        if process.poll() is None:
+            process.terminate()
+            with suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=3)
+        if process.poll() is None:
+            process.kill()
+            with suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=1)
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
 
     @staticmethod
     def _resolve_path(value: str) -> Path:

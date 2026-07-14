@@ -561,7 +561,52 @@ wren memory index --mdl "$WREN_PROJECT_DIR/target/mdl.json"
 - 首次比较慢是正常现象
 - 执行完成后会生成 `.wren/memory/`
 
-### 14.3 先做基础连通验证
+### 14.3 本地向量模型部署要求
+
+为了避免 `wren memory index` 或 `ask_service` 在初始化 `MemoryStore` 时再次走在线 Hugging Face 请求，推荐把 embedding 模型提前准备到本机。
+
+当前默认向量模型是：
+
+- `paraphrase-multilingual-MiniLM-L12-v2`
+
+推荐做法：
+
+1. 在服务器上先执行一次 `wren memory index`
+2. 等模型被下载到本机 Hugging Face 缓存后，再启动 `ask_service`
+3. 让 `ask_service` 优先使用本地 snapshot，而不是在线模型名
+
+如果你所在环境访问 Hugging Face 较慢，可以先设置镜像：
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+默认情况下，当前版本的 `ask_service` 会按下面顺序自动解析本地向量模型：
+
+1. `WREN_EMBEDDING_MODEL_LOCAL_PATH`
+2. `WREN_EMBEDDING_MODEL` 如果本身就是本地目录
+3. Hugging Face 本地缓存中的 `snapshot` 目录
+4. 最后才回退为模型名在线加载
+
+如果你想显式指定本地模型目录，可填写类似路径：
+
+```dotenv
+WREN_EMBEDDING_MODEL_LOCAL_PATH=/home/your_user/.cache/huggingface/hub/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/snapshots/<revision>
+```
+
+如果本机已经存在模型缓存，可以用下面命令查看：
+
+```bash
+ls ~/.cache/huggingface/hub/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/snapshots
+```
+
+说明：
+
+- `ask_service` 已支持优先使用本地 snapshot 路径
+- 这样可以保留向量召回能力，同时避免在线下载导致的初始化失败
+- 新机器部署时，建议先把 embedding 模型下载好，再进行联调
+
+### 14.4 先做基础连通验证
 
 建议先用真实 SQL 做连通测试：
 
@@ -600,6 +645,9 @@ WREN_MDL_PATH=biz-analytics/target/mdl.json
 WREN_CONN_FILE=biz-analytics/connection_info.json
 WREN_MEMORY_PATH=biz-analytics/.wren/memory
 
+WREN_EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2
+# WREN_EMBEDDING_MODEL_LOCAL_PATH=/home/your_user/.cache/huggingface/hub/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/snapshots/<revision>
+
 WREN_STRICT_MODE=true
 QUERY_TIMEOUT_SEC=90
 MAX_RESULT_ROWS=200
@@ -616,6 +664,8 @@ DEFAULT_FETCH_LIMIT=6
 - `WREN_MDL_PATH`
 - `WREN_CONN_FILE`
 - `WREN_MEMORY_PATH`
+- `WREN_EMBEDDING_MODEL`
+- `WREN_EMBEDDING_MODEL_LOCAL_PATH`
 
 ## 16. 启动与验证 `ask_service`
 
@@ -658,11 +708,15 @@ curl http://127.0.0.1:18082/status
 - `memory_state`
 - `memory_init_error`
 - `query_timeout_sec`
+- `embedding_model_source`
+- `embedding_model_resolved`
 
 说明：
 
 - `memory_state=warming_up` 表示服务已启动，但 Memory 仍在后台预热
 - `memory_state=ready` 表示问数已基本可用
+- `embedding_model_source=local_path` 表示当前向量模型已走本地目录加载
+- `embedding_model_resolved` 会显示最终生效的本地 snapshot 路径或模型名
 
 ### 16.5 问数测试
 
@@ -697,6 +751,13 @@ curl -X POST http://127.0.0.1:18082/api/ask \
 
 - Timeout：`90`
 
+填写说明：
+
+- 如果 `AgentVerse` 与 `ask_service` 在同一台机器，可直接用 `http://127.0.0.1:18082/api/ask`
+- 如果不在同一台机器，请改成 `ask_service` 所在机器可访问地址，例如 `http://10.0.0.15:18082/api/ask`
+- HTTP 节点的 `Timeout` 必须大于或等于 `ask_service/.env` 中的 `QUERY_TIMEOUT_SEC`
+- 当前项目默认 `QUERY_TIMEOUT_SEC=90`，因此 HTTP 节点建议也填 `90` 或更大
+
 ### 17.2 请求体
 
 最简单配置：
@@ -716,18 +777,136 @@ curl -X POST http://127.0.0.1:18082/api/ask \
 }
 ```
 
-### 17.3 条件分支
+如果你的工作流里用户问题来自上游节点变量，也可以直接把变量替换到 `question` 字段，例如：
 
-建议在工作流中判断：
+```json
+{
+  "question": "{{input}}"
+}
+```
+
+要求：
+
+- 请求体必须是合法 JSON
+- `question` 是必填字段
+- `allowed_regions` 是可选字段，类型必须是字符串数组
+
+### 17.3 成功返回字段
+
+`ask_service` 成功时会返回 `HTTP 200`，典型字段如下：
+
+```json
+{
+  "ok": true,
+  "trace_id": "xxx",
+  "need_clarification": false,
+  "clarification_question": "",
+  "question": "按客户地区统计订单数和销售额",
+  "sql": "SELECT ...",
+  "rows": [],
+  "summary": "华东地区订单数最多。",
+  "chart": {
+    "type": "table",
+    "xField": "",
+    "yField": ""
+  },
+  "latency_ms": 1234,
+  "error": null
+}
+```
+
+在 `AgentVerse` 的 HTTP 节点后续节点中，通常可使用：
+
+- `httpResult.ok`
+- `httpResult.need_clarification`
+- `httpResult.clarification_question`
+- `httpResult.summary`
+- `httpResult.sql`
+- `httpResult.rows`
+- `httpResult.chart`
+- `httpResult.latency_ms`
+
+### 17.4 失败返回字段与错误处理
+
+`ask_service` 失败时不会再固定返回 `200`，而是按场景返回正确状态码。
+
+常见情况：
+
+- `400`：规划结果非法、SQL 不安全、请求内容不合法
+- `422`：请求体缺字段或字段类型错误
+- `503`：大模型服务异常，或 `MemoryStore` 还未就绪
+- `504`：整体请求、LLM 调用或 SQL 执行超时
+- `500`：服务内部未分类异常
+
+失败响应体中通常仍会返回结构化 JSON，例如：
+
+```json
+{
+  "ok": false,
+  "trace_id": "xxx",
+  "need_clarification": false,
+  "clarification_question": "",
+  "question": "按客户地区统计订单数和销售额",
+  "sql": "",
+  "rows": [],
+  "summary": "",
+  "chart": {
+    "type": "table",
+    "xField": "",
+    "yField": ""
+  },
+  "latency_ms": 120,
+  "error": {
+    "code": "MEMORY_WARMING_UP",
+    "message": "MemoryStore 仍在预热，请稍后重试"
+  }
+}
+```
+
+如果 HTTP 节点配置正确，后续分支建议优先判断：
 
 - `httpResult.need_clarification`
 - `httpResult.ok`
+- `errorText`
 
 建议逻辑：
 
 - 如果 `httpResult.need_clarification=true`，回复 `httpResult.clarification_question`
 - 如果 `httpResult.ok=true`，回复 `httpResult.summary`
-- 如果 HTTP 节点报错或 `httpResult.ok=false`，进入兜底提示
+- 如果 `errorText` 非空，进入错误提示或重试分支
+- 如果 `httpResult.ok=false`，可进一步读取 `httpResult.error.code` 和 `httpResult.error.message`
+
+### 17.5 推荐的 HTTP 节点配置模板
+
+你可以直接按下面的模板在 `AgentVerse` 中填写：
+
+- URL：`http://127.0.0.1:18082/api/ask`
+- Method：`POST`
+- Headers：
+
+```json
+{
+  "Content-Type": "application/json"
+}
+```
+
+- Timeout：`90`
+- Body：
+
+```json
+{
+  "question": "{{用户输入}}"
+}
+```
+
+如果你要做地区权限约束：
+
+```json
+{
+  "question": "{{用户输入}}",
+  "allowed_regions": ["华东", "华北"]
+}
+```
 
 ## 18. 可选 systemd 部署
 

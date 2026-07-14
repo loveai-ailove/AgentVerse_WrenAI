@@ -1,3 +1,4 @@
+SET NAMES utf8mb4;
 CREATE TABLE IF NOT EXISTS customers (
   id INT PRIMARY KEY,
   customer_no VARCHAR(64) NOT NULL UNIQUE,
