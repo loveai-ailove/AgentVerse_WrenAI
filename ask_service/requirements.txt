@@ -2,4 +2,7 @@ fastapi==0.116.1
 uvicorn[standard]==0.35.0
 openai==1.97.0
 python-dotenv==1.1.1
+pydantic>=2,<3
 sqlparse==0.5.3
+sqlglot==30.12.0
+wrenai[mysql,memory,main]==0.13.0

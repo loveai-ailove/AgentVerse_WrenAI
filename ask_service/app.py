@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
@@ -15,6 +16,8 @@ from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 import sqlparse
+from sqlglot import exp, parse_one
+from sqlglot.errors import ParseError
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.encoders import jsonable_encoder
@@ -28,9 +31,40 @@ from wren.engine import WrenEngine
 from wren.memory.markdown import load_query_pairs
 from wren.memory.store import MemoryStore
 from wren.model.data_source import DataSource
+from wren.model.error import ErrorCode, ErrorPhase, WrenError
+
+# Shared worker pools.  SQL and Memory operations are isolated so a timeout in
+# one area cannot silently consume all workers of the other.  Each pool also has
+# a bounded semaphore used for explicit backpressure: once timed-out tasks have
+# occupied all workers, new requests fail fast instead of piling up indefinitely.
+_SQL_WORKERS = 4
+_MEMORY_WORKERS = 2
+_SQL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=_SQL_WORKERS)
+_MEMORY_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=_MEMORY_WORKERS)
+_SQL_SLOTS = threading.BoundedSemaphore(_SQL_WORKERS)
+_MEMORY_SLOTS = threading.BoundedSemaphore(_MEMORY_WORKERS)
 
 
 LOGGER = logging.getLogger("ask_service")
+
+
+def _require_env_str(key: str) -> str:
+    """Return *key* from the environment, raising a clear RuntimeError
+    if it is missing instead of KeyError (which would crash at import time)."""
+    value = os.getenv(key)
+    if value is None:
+        raise RuntimeError(f"缺少必需的环境变量: {key}")
+    return value
+
+
+def _parse_env_int(key: str, default: str) -> int:
+    """Parse *key* as int with a *default* string fallback.
+    Raises RuntimeError with a clear message on invalid values."""
+    raw = os.getenv(key, default)
+    try:
+        return int(raw)
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError(f"环境变量 {key} 的值必须是整数，当前值: {raw!r}") from exc
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -75,7 +109,7 @@ class AskResponse(BaseModel):
 class AskRuntime:
     def __init__(self) -> None:
         self.ask_host = os.getenv("ASK_HOST", "127.0.0.1")
-        self.ask_port = int(os.getenv("ASK_PORT", "18082"))
+        self.ask_port = _parse_env_int("ASK_PORT", "18082")
         self.vllm_base_url = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1")
         self.vllm_api_key = os.getenv("VLLM_API_KEY", "dummy")
         self.vllm_model = os.getenv("VLLM_MODEL", "qwen2.5-7b-instruct")
@@ -91,17 +125,22 @@ class AskRuntime:
             "local_path" if self.embedding_model_local_path else "model_name"
         )
 
-        self.project_path = self._resolve_path(os.environ["WREN_PROJECT_PATH"])
-        self.mdl_path = self._resolve_path(os.environ["WREN_MDL_PATH"])
-        self.conn_file = self._resolve_path(os.environ["WREN_CONN_FILE"])
-        self.memory_path = self._resolve_path(os.environ["WREN_MEMORY_PATH"])
+        self.project_path = self._resolve_path(_require_env_str("WREN_PROJECT_PATH"))
+        self.mdl_path = self._resolve_path(_require_env_str("WREN_MDL_PATH"))
+        self.conn_file = self._resolve_path(_require_env_str("WREN_CONN_FILE"))
+        self.memory_path = self._resolve_path(_require_env_str("WREN_MEMORY_PATH"))
 
         self.strict_mode = os.getenv("WREN_STRICT_MODE", "true").lower() == "true"
-        self.query_timeout_sec = int(os.getenv("QUERY_TIMEOUT_SEC", "90"))
-        self.max_result_rows = int(os.getenv("MAX_RESULT_ROWS", "200"))
-        self.default_recall_limit = int(os.getenv("DEFAULT_RECALL_LIMIT", "3"))
-        self.default_fetch_limit = int(os.getenv("DEFAULT_FETCH_LIMIT", "6"))
-        self.context_threshold = int(os.getenv("CONTEXT_THRESHOLD", "30000"))
+        self.query_timeout_sec = _parse_env_int("QUERY_TIMEOUT_SEC", "90")
+        self.max_result_rows = _parse_env_int("MAX_RESULT_ROWS", "200")
+        self.default_recall_limit = _parse_env_int("DEFAULT_RECALL_LIMIT", "3")
+        self.default_fetch_limit = _parse_env_int("DEFAULT_FETCH_LIMIT", "6")
+        self.context_threshold = _parse_env_int("CONTEXT_THRESHOLD", "30000")
+
+        # Protect _sync_memory_store_state() and reindex() from concurrent access.
+        # RLock is required because reindex() may call require_memory_store(),
+        # which in turn may enter _sync_memory_store_state().
+        self._memory_lock = threading.RLock()
 
         self.memory_store: MemoryStore | None = None
         self.llm_client: OpenAI | None = None
@@ -231,7 +270,10 @@ class AskRuntime:
             return self._manifest_dict, self._manifest_b64
 
         content = self.mdl_path.read_bytes()
-        self._manifest_dict = json.loads(content.decode("utf-8"))
+        try:
+            self._manifest_dict = json.loads(content.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"MDL 文件不是合法 JSON: {self.mdl_path}") from exc
         self._manifest_b64 = base64.b64encode(content).decode("utf-8")
         self._manifest_mtime_ns = current_mtime
         return self._manifest_dict, self._manifest_b64
@@ -240,11 +282,12 @@ class AskRuntime:
         return self._load_manifest()
 
     def reindex(self) -> dict[str, Any]:
-        manifest, _ = self._load_manifest(force=True)
-        memory_store = self.require_memory_store()
-        schema_result = memory_store.index_schema(manifest, seed_queries=True)
-        md_pairs = load_query_pairs(self.project_path)
-        query_result = memory_store.load_queries(md_pairs, upsert=True) if md_pairs else {}
+        with self._memory_lock:
+            manifest, _ = self._load_manifest(force=True)
+            memory_store = self.require_memory_store()
+            schema_result = memory_store.index_schema(manifest, seed_queries=True)
+            md_pairs = load_query_pairs(self.project_path)
+            query_result = memory_store.load_queries(md_pairs, upsert=True) if md_pairs else {}
         return {
             "schema_result": schema_result,
             "query_result": query_result,
@@ -269,7 +312,10 @@ class AskRuntime:
         return conn
 
     def _load_connection_info(self, path: Path) -> dict[str, Any]:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"连接配置文件不是合法 JSON: {path}") from exc
         if not isinstance(raw, dict):
             raise RuntimeError(f"连接配置必须是 JSON Object: {path}")
         return self._normalize_conn(raw)
@@ -311,37 +357,42 @@ class AskRuntime:
     def _sync_memory_store_state(self) -> None:
         if self.memory_store is not None or self._memory_warmup_process is None:
             return
-        process = self._memory_warmup_process
-        return_code = process.poll()
-        if return_code is None:
-            return
-        stdout, stderr = process.communicate()
-        self._memory_warmup_process = None
-        try:
-            if return_code != 0:
-                error_text = stderr.strip() or stdout.strip() or f"预热子进程退出码异常: {return_code}"
-                raise RuntimeError(error_text)
-            log_event(
-                "startup_memory_warmup_completed",
-                memory_path=str(self.memory_path),
-                warmup_pid=process.pid,
-                worker_output=shorten_text(stdout.strip(), 200) if stdout.strip() else "",
-            )
-            self.memory_store = self._build_memory_store()
-            self._memory_init_error = None
-        except Exception as exc:
-            self._memory_init_error = str(exc)
-            log_event("startup_memory_failed", memory_path=str(self.memory_path), error=str(exc))
 
-        # Auto-index schema so the "search" strategy is available for large
-        # manifests (> context_threshold chars).  Failures here are non-fatal:
-        # the "full" strategy still works regardless.
-        if self.memory_store is not None and self._manifest_dict is not None:
+        with self._memory_lock:
+            if self.memory_store is not None or self._memory_warmup_process is None:
+                return
+
+            process = self._memory_warmup_process
+            return_code = process.poll()
+            if return_code is None:
+                return
             try:
-                self.memory_store.index_schema(self._manifest_dict, replace=True)
-                log_event("schema_index_completed", memory_path=str(self.memory_path))
+                stdout, stderr = process.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate()
+            self._memory_warmup_process = None
+            try:
+                if return_code != 0:
+                    error_text = stderr.strip() or stdout.strip() or f"预热子进程退出码异常: {return_code}"
+                    raise RuntimeError(error_text)
+                log_event(
+                    "startup_memory_warmup_completed",
+                    memory_path=str(self.memory_path),
+                    warmup_pid=process.pid,
+                    worker_output=shorten_text(stdout.strip(), 200) if stdout.strip() else "",
+                )
+                self.memory_store = self._build_memory_store()
+                self._memory_init_error = None
+                # Keep schema indexing inside the same critical section so a
+                # concurrent reindex() or ask() cannot observe a partially
+                # initialised search index.
+                if self.memory_store is not None and self._manifest_dict is not None:
+                    self.memory_store.index_schema(self._manifest_dict, replace=True)
+                    log_event("schema_index_completed", memory_path=str(self.memory_path))
             except Exception as exc:
-                log_event("schema_index_warning", memory_path=str(self.memory_path), error=str(exc))
+                self._memory_init_error = str(exc)
+                log_event("startup_memory_failed", memory_path=str(self.memory_path), error=str(exc))
 
     def _memory_state(self) -> str:
         if self.memory_store is not None:
@@ -456,8 +507,7 @@ class AskRuntime:
             return path
         return (PROJECT_ROOT / path).resolve()
 
-
-runtime = AskRuntime()
+runtime: AskRuntime | None = None
 
 
 class RequestTimeoutError(TimeoutError):
@@ -470,6 +520,20 @@ class SQLTimeoutError(TimeoutError):
 
 class MemoryStoreNotReadyError(RuntimeError):
     pass
+
+
+class InvalidInputError(ValueError):
+    """Raised for invalid user input (e.g. empty question)."""
+
+
+class ServiceBusyError(RuntimeError):
+    """Raised when executor slots are exhausted by still-running tasks."""
+
+
+def get_runtime() -> AskRuntime:
+    if runtime is None:
+        raise RuntimeError("ask_service 尚未完成初始化")
+    return runtime
 
 
 def json_dumps(value: Any) -> str:
@@ -597,30 +661,33 @@ def ensure_safe_sql(sql: str) -> str:
     if not sql:
         raise ValueError("LLM 没有返回可执行 SQL")
 
-    lowered = f" {sql.lower()} "
-    forbidden = [
-        " insert ",
-        " update ",
-        " delete ",
-        " drop ",
-        " truncate ",
-        " alter ",
-        " create ",
-        " grant ",
-        " revoke ",
-        " replace ",
-    ]
-    if any(token in lowered for token in forbidden):
-        raise ValueError("仅允许只读 SELECT/WITH 查询")
-
     statements = [part.strip() for part in sqlparse.split(sql) if part.strip()]
     if len(statements) != 1:
         raise ValueError("仅允许单条 SQL")
+    statement = statements[0]
+    try:
+        tree = parse_one(statement, read="mysql")
+    except ParseError as exc:
+        raise ValueError("SQL 解析失败，无法验证其安全性") from exc
 
-    first = statements[0].split(None, 1)[0].lower()
-    if first not in {"select", "with"}:
+    forbidden_nodes = (
+        exp.Insert,
+        exp.Update,
+        exp.Delete,
+        exp.Drop,
+        exp.Create,
+        exp.Alter,
+        exp.Grant,
+        exp.Revoke,
+        exp.Merge,
+        exp.Command,
+        exp.Use,
+    )
+    if any(tree.find(node_type) is not None for node_type in forbidden_nodes):
+        raise ValueError("仅允许只读 SELECT/WITH 查询")
+    if tree.find(exp.Select) is None:
         raise ValueError("仅允许 SELECT/WITH 查询")
-    return statements[0]
+    return statement
 
 
 def normalize_chart(chart: Any) -> dict[str, Any]:
@@ -636,7 +703,7 @@ def normalize_chart(chart: Any) -> dict[str, Any]:
 
 def remaining_timeout_seconds(deadline: float | None) -> float:
     if deadline is None:
-        return float(runtime.query_timeout_sec)
+        return float(get_runtime().query_timeout_sec)
     remaining = deadline - time.perf_counter()
     if remaining <= 0:
         raise RequestTimeoutError("问数请求整体超时")
@@ -649,15 +716,32 @@ def run_with_timeout(
     timeout_sec: float,
     timeout_exc: type[Exception],
     timeout_message: str,
+    executor_name: str = "sql",
     **kwargs: Any,
 ) -> T:
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+    if executor_name == "memory":
+        executor = _MEMORY_EXECUTOR
+        slots = _MEMORY_SLOTS
+        busy_message = "Memory 检索任务繁忙，请稍后重试"
+    else:
+        executor = _SQL_EXECUTOR
+        slots = _SQL_SLOTS
+        busy_message = "SQL 执行任务繁忙，请稍后重试"
+
+    if not slots.acquire(timeout=min(timeout_sec, 1.0)):
+        raise ServiceBusyError(busy_message)
+
+    try:
         future = executor.submit(func, *args, **kwargs)
-        try:
-            return future.result(timeout=timeout_sec)
-        except concurrent.futures.TimeoutError as exc:
-            future.cancel()
-            raise timeout_exc(timeout_message) from exc
+    except Exception:
+        slots.release()
+        raise
+    future.add_done_callback(lambda _future: slots.release())
+    try:
+        return future.result(timeout=timeout_sec)
+    except concurrent.futures.TimeoutError as exc:
+        future.cancel()
+        raise timeout_exc(timeout_message) from exc
 
 
 def llm_chat(
@@ -666,12 +750,13 @@ def llm_chat(
     temperature: float = 0.1,
     timeout_sec: float | None = None,
 ) -> str:
-    assert runtime.llm_client is not None
-    response = runtime.llm_client.chat.completions.create(
-        model=runtime.vllm_model,
+    service_runtime = get_runtime()
+    assert service_runtime.llm_client is not None
+    response = service_runtime.llm_client.chat.completions.create(
+        model=service_runtime.vllm_model,
         temperature=temperature,
         messages=messages,
-        timeout=timeout_sec or float(runtime.query_timeout_sec),
+        timeout=timeout_sec or float(service_runtime.query_timeout_sec),
     )
     return (response.choices[0].message.content or "").strip()
 
@@ -772,24 +857,6 @@ allowed_regions：
 """.strip()
 
 
-def build_summary_prompt(question: str, sql: str, rows: list[dict[str, Any]]) -> str:
-    return f"""
-你是中文数据分析助手。
-请根据用户问题、SQL 和结果，生成简洁准确的中文结论。
-如果结果为空，请明确回复“未查询到符合条件的数据”。
-不要编造没有出现在结果中的数值。
-
-用户问题：
-{question}
-
-SQL：
-{sql}
-
-查询结果：
-{json_dumps(rows)}
-""".strip()
-
-
 def llm_plan(
     *,
     question: str,
@@ -820,32 +887,10 @@ def llm_plan(
     return parse_plan_response(raw_text, timeout_sec=timeout_sec)
 
 
-def llm_summary(
-    question: str,
-    sql: str,
-    rows: list[dict[str, Any]],
-    *,
-    timeout_sec: float | None = None,
-) -> str:
-    return llm_chat(
-        [
-            {
-                "role": "system",
-                "content": "你是中文数据分析助手，请输出简洁、可信的业务结论。",
-            },
-            {
-                "role": "user",
-                "content": build_summary_prompt(question, sql, rows),
-            },
-        ],
-        temperature=0.2,
-        timeout_sec=timeout_sec,
-    )
-
-
 def _query_sql(sql: str) -> list[dict[str, Any]]:
-    with runtime.build_engine() as engine:
-        table = engine.query(sql, limit=runtime.max_result_rows)
+    service_runtime = get_runtime()
+    with service_runtime.build_engine() as engine:
+        table = engine.query(sql, limit=service_runtime.max_result_rows)
     return table.to_pylist()
 
 
@@ -857,6 +902,7 @@ def execute_sql(sql: str, *, timeout_sec: float) -> list[dict[str, Any]]:
         timeout_sec=timeout_sec,
         timeout_exc=SQLTimeoutError,
         timeout_message="SQL 执行超时",
+        executor_name="sql",
     )
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     log_event(
@@ -869,7 +915,7 @@ def execute_sql(sql: str, *, timeout_sec: float) -> list[dict[str, Any]]:
 
 
 def _dry_run_sql(sql: str) -> None:
-    with runtime.build_engine() as engine:
+    with get_runtime().build_engine() as engine:
         engine.dry_run(sql)
 
 
@@ -881,6 +927,7 @@ def dry_run_sql(sql: str, *, timeout_sec: float) -> None:
         timeout_sec=timeout_sec,
         timeout_exc=SQLTimeoutError,
         timeout_message="SQL 预检查超时",
+        executor_name="sql",
     )
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     log_event(
@@ -893,6 +940,28 @@ def dry_run_sql(sql: str, *, timeout_sec: float) -> None:
 def classify_exception(exc: Exception) -> ErrorInfo:
     if isinstance(exc, MemoryStoreNotReadyError):
         return ErrorInfo(code="MEMORY_WARMING_UP", message=str(exc))
+    if isinstance(exc, WrenError):
+        if exc.error_code == ErrorCode.DATABASE_TIMEOUT:
+            return ErrorInfo(code="WREN_TIMEOUT", message=str(exc))
+        if exc.phase in {ErrorPhase.SQL_PLANNING, ErrorPhase.SQL_PARSING, ErrorPhase.VALIDATION, ErrorPhase.SQL_POLICY_CHECK}:
+            return ErrorInfo(code="WREN_BAD_REQUEST", message=str(exc))
+        if exc.error_code in {
+            ErrorCode.GENERIC_USER_ERROR,
+            ErrorCode.NOT_FOUND,
+            ErrorCode.MDL_NOT_FOUND,
+            ErrorCode.INVALID_SQL,
+            ErrorCode.INVALID_MDL,
+            ErrorCode.VALIDATION_ERROR,
+            ErrorCode.INVALID_CONNECTION_INFO,
+            ErrorCode.MODEL_NOT_FOUND,
+            ErrorCode.BLOCKED_FUNCTION,
+        }:
+            return ErrorInfo(code="WREN_BAD_REQUEST", message=str(exc))
+        return ErrorInfo(code="WREN_ERROR", message=str(exc))
+    if isinstance(exc, InvalidInputError):
+        return ErrorInfo(code="INVALID_INPUT", message=str(exc))
+    if isinstance(exc, ServiceBusyError):
+        return ErrorInfo(code="SERVICE_BUSY", message=str(exc))
     if isinstance(exc, ValueError):
         return ErrorInfo(code="BAD_PLAN", message=str(exc))
     if isinstance(exc, RequestTimeoutError):
@@ -911,20 +980,52 @@ def classify_exception(exc: Exception) -> ErrorInfo:
 def status_code_for_exception(exc: Exception) -> int:
     if isinstance(exc, MemoryStoreNotReadyError):
         return 503
+    if isinstance(exc, WrenError):
+        if exc.error_code == ErrorCode.DATABASE_TIMEOUT:
+            return 504
+        if exc.phase in {ErrorPhase.SQL_PLANNING, ErrorPhase.SQL_PARSING, ErrorPhase.VALIDATION, ErrorPhase.SQL_POLICY_CHECK}:
+            return 400
+        if exc.error_code in {
+            ErrorCode.GENERIC_USER_ERROR,
+            ErrorCode.NOT_FOUND,
+            ErrorCode.MDL_NOT_FOUND,
+            ErrorCode.INVALID_SQL,
+            ErrorCode.INVALID_MDL,
+            ErrorCode.VALIDATION_ERROR,
+            ErrorCode.INVALID_CONNECTION_INFO,
+            ErrorCode.MODEL_NOT_FOUND,
+            ErrorCode.BLOCKED_FUNCTION,
+        }:
+            return 400
+        return 502
+    if isinstance(exc, InvalidInputError):
+        return 422
+    if isinstance(exc, ServiceBusyError):
+        return 503
     if isinstance(exc, ValueError):
         return 400
     if isinstance(exc, (RequestTimeoutError, SQLTimeoutError, APITimeoutError, TimeoutError)):
         return 504
-    if isinstance(exc, (BadRequestError, OpenAIAPIError)):
+    if isinstance(exc, BadRequestError):
+        return 502
+    if isinstance(exc, OpenAIAPIError):
         return 503
     return 500
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    runtime.startup()
-    yield
-    runtime.shutdown()
+    global runtime
+    try:
+        runtime = AskRuntime()
+        runtime.startup()
+        yield
+    finally:
+        if runtime is not None:
+            runtime.shutdown()
+        _SQL_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+        _MEMORY_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+        runtime = None
 
 
 app = FastAPI(title="ask_service", version="1.0.0", lifespan=lifespan)
@@ -932,24 +1033,25 @@ app = FastAPI(title="ask_service", version="1.0.0", lifespan=lifespan)
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+    service_runtime = get_runtime()
     return {
         "ok": True,
         "service": "ask_service",
-        "ask_host": runtime.ask_host,
-        "ask_port": runtime.ask_port,
-        "project_path": str(runtime.project_path),
-        "mdl_path": str(runtime.mdl_path),
-        "memory_path": str(runtime.memory_path),
-        "vllm_base_url": runtime.vllm_base_url,
-        "vllm_model": runtime.vllm_model,
-        "strict_mode": runtime.config.strict_mode,
-        "query_timeout_sec": runtime.query_timeout_sec,
+        "ask_host": service_runtime.ask_host,
+        "ask_port": service_runtime.ask_port,
+        "project_path": str(service_runtime.project_path),
+        "mdl_path": str(service_runtime.mdl_path),
+        "memory_path": str(service_runtime.memory_path),
+        "vllm_base_url": service_runtime.vllm_base_url,
+        "vllm_model": service_runtime.vllm_model,
+        "strict_mode": service_runtime.config.strict_mode,
+        "query_timeout_sec": service_runtime.query_timeout_sec,
     }
 
 
 @app.get("/status")
 def status() -> dict[str, Any]:
-    return runtime.status()
+    return get_runtime().status()
 
 
 @app.post("/admin/reindex")
@@ -957,7 +1059,7 @@ def reindex() -> Any:
     try:
         return {
             "ok": True,
-            **runtime.reindex(),
+            **get_runtime().reindex(),
         }
     except Exception as exc:  # noqa: BLE001
         status_code = status_code_for_exception(exc)
@@ -969,36 +1071,47 @@ def reindex() -> Any:
 
 @app.post("/api/ask", response_model=AskResponse)
 def ask(req: AskRequest) -> AskResponse:
+    service_runtime = get_runtime()
     trace_id = uuid.uuid4().hex[:16]
     start = time.time()
-    deadline = time.perf_counter() + runtime.query_timeout_sec
+    deadline = time.perf_counter() + service_runtime.query_timeout_sec
 
     try:
         if not req.question.strip():
-            raise ValueError("问题不能为空")
+            raise InvalidInputError("问题不能为空")
 
         log_event(
             "ask_request_received",
             trace_id=trace_id,
             question=shorten_text(req.question),
             allowed_regions=req.allowed_regions,
-            recall_limit=req.recall_limit or runtime.default_recall_limit,
-            fetch_limit=req.fetch_limit or runtime.default_fetch_limit,
+            recall_limit=req.recall_limit or service_runtime.default_recall_limit,
+            fetch_limit=req.fetch_limit or service_runtime.default_fetch_limit,
         )
 
-        memory_store = runtime.require_memory_store()
+        memory_store = service_runtime.require_memory_store()
         recall_started = time.perf_counter()
-        manifest, _ = runtime.current_manifest()
+        manifest, _ = service_runtime.current_manifest()
 
-        recalls = memory_store.recall_queries(
+        recalls = run_with_timeout(
+            memory_store.recall_queries,
             req.question,
-            limit=req.recall_limit or runtime.default_recall_limit,
+            limit=req.recall_limit or service_runtime.default_recall_limit,
+            timeout_sec=remaining_timeout_seconds(deadline),
+            timeout_exc=RequestTimeoutError,
+            timeout_message="语义召回操作超时",
+            executor_name="memory",
         )
-        fetched = memory_store.get_context(
+        fetched = run_with_timeout(
+            memory_store.get_context,
             manifest,
             req.question,
-            limit=req.fetch_limit or runtime.default_fetch_limit,
-            threshold=runtime.context_threshold,
+            limit=req.fetch_limit or service_runtime.default_fetch_limit,
+            threshold=service_runtime.context_threshold,
+            timeout_sec=remaining_timeout_seconds(deadline),
+            timeout_exc=RequestTimeoutError,
+            timeout_message="语义上下文获取超时",
+            executor_name="memory",
         )
         recall_elapsed_ms = int((time.perf_counter() - recall_started) * 1000)
         fetched_strategy = fetched.get("strategy")

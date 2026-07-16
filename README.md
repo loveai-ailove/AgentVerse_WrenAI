@@ -1,5 +1,9 @@
 # WrenAI + AgentVerse 使用手册
 
+> **此文档已过时，请优先参阅 [README_NEW.md](./README_NEW.md)**  
+> 部分配置项（如 `CONTEXT_THRESHOLD`、`WREN_EMBEDDING_MODEL`、错误码列表）可能不完整，  
+> 接口行为（如 `summary` 不再由 ask_service 生成）可能已变更。
+
 本文档从一个新使用者第一次接手项目的角度编写，目标是帮助你完成下面这件事：
 
 - 基于已有的 MySQL 业务数据库安装 `WrenAI`

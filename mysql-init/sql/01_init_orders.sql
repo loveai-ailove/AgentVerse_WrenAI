@@ -60,7 +60,3 @@ VALUES
 ('ORD-20260709-010', 110, '机械硬盘 4TB', '电脑配件',  459.00, 2,  918.00, 'COMPLETED', 'BANKCARD', '华东', '2026-07-09 09:35:00', '2026-07-09 09:40:00'),
 ('ORD-20260711-011', 111, '高清摄像头',   '电脑配件',  699.00, 1,  699.00, 'PAID',      'WECHAT',   '华北', '2026-07-11 18:25:00', '2026-07-11 18:30:00'),
 ('ORD-20260712-012', 112, '激光打印机',   '办公设备', 1299.00, 1, 1299.00, 'SHIPPED',   'ALIPAY',   '华南', '2026-07-12 10:45:00', '2026-07-12 10:50:00');
-
-CREATE USER IF NOT EXISTS 'wren_reader'@'%' IDENTIFIED BY 'WrenReader_123456';
-GRANT SELECT, SHOW VIEW ON wren_demo.* TO 'wren_reader'@'%';
-FLUSH PRIVILEGES;
