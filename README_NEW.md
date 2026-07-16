@@ -804,7 +804,7 @@ curl -X POST http://127.0.0.1:18082/api/ask \
   "question": "按客户地区统计订单数和销售额",
   "sql": "SELECT ...",
   "rows": [],
-  "summary": "华东地区订单数最多。",
+  "summary": "",
   "chart": {
     "type": "table",
     "xField": "",
@@ -820,11 +820,16 @@ curl -X POST http://127.0.0.1:18082/api/ask \
 - `httpResult.ok`
 - `httpResult.need_clarification`
 - `httpResult.clarification_question`
-- `httpResult.summary`
 - `httpResult.sql`
 - `httpResult.rows`
 - `httpResult.chart`
 - `httpResult.latency_ms`
+
+说明：
+
+- 当前 `ask_service` 不再调用 `llm_summary` 生成自然语言总结
+- `summary` 字段仍保留，但成功场景下默认返回空字符串以保持响应结构兼容
+- 推荐在 `AgentVerse` 的下游 AI 对话节点中直接使用 `httpResult.question`、`httpResult.sql`、`httpResult.rows`、`httpResult.chart` 生成最终回复
 
 ### 17.4 失败返回字段与错误处理
 

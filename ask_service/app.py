@@ -1036,14 +1036,6 @@ def ask(req: AskRequest) -> AskResponse:
         sql = ensure_safe_sql(str(plan.get("sql", "")))
         dry_run_sql(sql, timeout_sec=remaining_timeout_seconds(deadline))
         rows = execute_sql(sql, timeout_sec=remaining_timeout_seconds(deadline))
-        summary_started = time.perf_counter()
-        summary = llm_summary(
-            req.question,
-            sql,
-            rows,
-            timeout_sec=remaining_timeout_seconds(deadline),
-        )
-        summary_elapsed_ms = int((time.perf_counter() - summary_started) * 1000)
 
         latency_ms = int((time.time() - start) * 1000)
         response = make_response(
@@ -1052,7 +1044,7 @@ def ask(req: AskRequest) -> AskResponse:
             question=req.question,
             sql=sql,
             rows=rows,
-            summary=summary,
+            summary="",
             chart=normalize_chart(plan.get("chart")),
             latency_ms=latency_ms,
         )
@@ -1061,7 +1053,6 @@ def ask(req: AskRequest) -> AskResponse:
             trace_id=trace_id,
             latency_ms=latency_ms,
             row_count=len(rows),
-            summary_elapsed_ms=summary_elapsed_ms,
             sql_preview=shorten_text(sql, 200),
         )
         return response
