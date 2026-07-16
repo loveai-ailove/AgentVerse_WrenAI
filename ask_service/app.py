@@ -101,6 +101,7 @@ class AskRuntime:
         self.max_result_rows = int(os.getenv("MAX_RESULT_ROWS", "200"))
         self.default_recall_limit = int(os.getenv("DEFAULT_RECALL_LIMIT", "3"))
         self.default_fetch_limit = int(os.getenv("DEFAULT_FETCH_LIMIT", "6"))
+        self.context_threshold = int(os.getenv("CONTEXT_THRESHOLD", "30000"))
 
         self.memory_store: MemoryStore | None = None
         self.llm_client: OpenAI | None = None
@@ -331,6 +332,16 @@ class AskRuntime:
         except Exception as exc:
             self._memory_init_error = str(exc)
             log_event("startup_memory_failed", memory_path=str(self.memory_path), error=str(exc))
+
+        # Auto-index schema so the "search" strategy is available for large
+        # manifests (> context_threshold chars).  Failures here are non-fatal:
+        # the "full" strategy still works regardless.
+        if self.memory_store is not None and self._manifest_dict is not None:
+            try:
+                self.memory_store.index_schema(self._manifest_dict, replace=True)
+                log_event("schema_index_completed", memory_path=str(self.memory_path))
+            except Exception as exc:
+                log_event("schema_index_warning", memory_path=str(self.memory_path), error=str(exc))
 
     def _memory_state(self) -> str:
         if self.memory_store is not None:
@@ -719,6 +730,11 @@ def build_plan_prompt(
     fetched: dict[str, Any],
     allowed_regions: list[str],
 ) -> str:
+    if fetched.get("strategy") == "full" and isinstance(fetched.get("schema"), str):
+        context_text = fetched["schema"]
+    else:
+        context_text = json_dumps(fetched)
+
     return f"""
 你是一个基于 Wren 语义层的 BI 问数助手。
 你必须输出 JSON 对象，不允许输出 markdown，不允许输出解释。
@@ -749,7 +765,7 @@ def build_plan_prompt(
 {json_dumps(recalls)}
 
 语义上下文：
-{json_dumps(fetched)}
+{context_text}
 
 allowed_regions：
 {json_dumps(allowed_regions)}
@@ -982,17 +998,29 @@ def ask(req: AskRequest) -> AskResponse:
             manifest,
             req.question,
             limit=req.fetch_limit or runtime.default_fetch_limit,
-            threshold=30000,
+            threshold=runtime.context_threshold,
         )
         recall_elapsed_ms = int((time.perf_counter() - recall_started) * 1000)
-        log_event(
-            "ask_context_ready",
-            trace_id=trace_id,
-            recall_count=len(recalls),
-            fetch_strategy=fetched.get("strategy"),
-            fetch_result_count=len(fetched.get("results", [])) if isinstance(fetched, dict) else 0,
-            elapsed_ms=recall_elapsed_ms,
-        )
+        fetched_strategy = fetched.get("strategy")
+        if fetched_strategy == "full":
+            log_event(
+                "ask_context_ready",
+                trace_id=trace_id,
+                recall_count=len(recalls),
+                fetch_strategy=fetched_strategy,
+                schema_chars=len(fetched.get("schema", "")),
+                elapsed_ms=recall_elapsed_ms,
+            )
+        else:
+            results = fetched.get("results", [])
+            log_event(
+                "ask_context_ready",
+                trace_id=trace_id,
+                recall_count=len(recalls),
+                fetch_strategy=fetched_strategy,
+                fetch_result_count=len(results) if isinstance(results, list) else 0,
+                elapsed_ms=recall_elapsed_ms,
+            )
 
         plan_started = time.perf_counter()
         plan = llm_plan(
