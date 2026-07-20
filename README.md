@@ -1,118 +1,108 @@
-# WrenAI + AgentVerse 使用手册
+# AgentVerse_WrenAI 新环境重部署手册
 
-> **此文档已过时，请优先参阅 [README_NEW.md](./README_NEW.md)**  
-> 部分配置项（如 `CONTEXT_THRESHOLD`、`WREN_EMBEDDING_MODEL`、错误码列表）可能不完整，  
-> 接口行为（如 `summary` 不再由 ask_service 生成）可能已变更。
+本文档面向下面这个场景：
 
-本文档从一个新使用者第一次接手项目的角度编写，目标是帮助你完成下面这件事：
-
-- 基于已有的 MySQL 业务数据库安装 `WrenAI`
-- 手工创建并配置一个可运行的 Wren 项目
-- 启动 `ask_service` 提供自然语言问数接口
-- 在 `AgentVerse` 中通过 HTTP 节点接入该接口
-
-本文档默认前提如下：
-
-- MySQL 数据库已经存在
+- 你在一台新的 Linux 机器上重新部署 `AgentVerse_WrenAI`
+- 代码是刚从 GitHub `clone` 下来的
+- MySQL 不是示例测试库，而是一个已经存在的业务数据库
 - 数据库中已经有业务表和业务数据
-- 不需要初始化测试数据
-- 只需要完成项目文件的创建、配置、启动和联调
+- 你希望最终实现：
+  - 使用 WrenAI 为 MySQL 建立语义层
+  - 启动 `ask_service` 提供自然语言问数接口
+  - 让 `AgentVerse` 通过 HTTP 节点调用这个接口
 
-## 1. 总体架构
+本文档不会使用根目录的 `docker-compose.yml` 初始化示例数据。
+如果你接的是现有业务 MySQL，请把 `order-demo/` 视为示例，不要直接把它当成你的正式业务模型。
 
-整体链路如下：
+## 1. 总体目标
+
+完整链路如下：
 
 ```text
 用户
   -> AgentVerse 智能体 / 工作流
   -> HTTP 节点调用 ask_service
   -> ask_service
-     -> WrenAI Memory / MDL / SQL 执行
+     -> WrenAI (MDL / Memory / SQL)
      -> MySQL
      -> vLLM(OpenAI 兼容接口)
   -> 返回结果给 AgentVerse
-  -> AgentVerse 回复用户
 ```
 
-各组件职责如下：
+在一个全新的环境中，推荐按下面顺序完成部署：
 
-- `WrenAI`：负责语义建模、关系建模、Memory 检索、SQL 执行
-- `ask_service`：负责自然语言问数编排
-- `vLLM`：负责 NL2SQL 和结果总结
-- `AgentVerse`：负责对话入口、工作流编排和最终回复
+1. `git clone` 项目源码
+2. 安装 Python 和系统依赖
+3. 创建虚拟环境并安装 `WrenAI`
+4. 盘点现有 MySQL 表结构
+5. 新建一个你自己的 Wren 项目目录
+6. 为新数据库创建 `models/`、`relationships.yml`、`knowledge/`
+7. 编译 MDL 并建立 Memory 索引
+8. 配置并启动 `ask_service`
+9. 在 `AgentVerse` 中配置 HTTP 节点并联调
 
-## 2. 目录说明
+## 2. 部署原则
 
-下面是示例工程目录。每个节点后面只保留一种状态说明：
+在“新环境 + 新业务库”的场景下，最容易出问题的不是安装，而是建模范围过大、语义不清、问数不准。
 
-- `手工创建`：表示需要你自己创建或维护
-- `命令生成`：表示执行命令后会自动出现
+因此建议遵循下面几条原则：
 
-```text
-/home/lb/data/AgentVerse_WrenAI                    # 项目根目录，统一放置 Wren 项目、ask_service 和文档；手工创建
-├── README.md                                      # 使用手册；手工创建
-├── .gitignore                                     # Git 忽略规则；手工创建
-├── .env                                           # 本地 MySQL 容器变量，仅在需要容器测试时使用；手工创建
-├── .env.example                                   # MySQL 容器变量模板；手工创建
-├── docker-compose.yml                             # 示例 MySQL 测试容器编排；手工创建
-├── ask_service/                                   # 问数 HTTP 服务目录；手工创建
-│   ├── .env                                       # ask_service 本地配置文件；手工创建
-│   ├── .env.example                               # ask_service 配置模板；手工创建
-│   ├── app.py                                     # ask_service 主程序；手工创建
-│   ├── requirements.txt                           # ask_service 依赖清单；手工创建
-│   └── systemd/                                   # systemd 部署文件目录；手工创建
-│       └── ask-service.service                    # systemd 服务文件；手工创建
-├── mysql-init/                                    # 示例初始化 SQL 目录，仅在你想本地造测试库时使用；手工创建
-│   └── 01_init_orders.sql                         # 示例初始化脚本；手工创建
-└── order-demo/                                    # WrenAI 项目目录；手工创建
-    ├── connection_info.json                       # MySQL 连接配置；手工创建
-    ├── connection_info.example.json               # MySQL 连接模板；手工创建
-    ├── wren_project.yml                           # Wren 项目主配置；手工创建
-    ├── relationships.yml                          # 模型关系定义；手工创建
-    ├── models/                                    # 模型定义目录；手工创建
-    │   ├── customers/                             # customers 表模型目录；手工创建
-    │   │   └── metadata.yml                       # customers 模型定义；手工创建
-    │   └── orders/                                # orders 表模型目录；手工创建
-    │       └── metadata.yml                       # orders 模型定义；手工创建
-    ├── cubes/                                     # Cube 定义目录；手工创建
-    │   └── order_metrics/                         # 示例订单统计 cube 目录；手工创建
-    │       └── metadata.yml                       # cube 定义文件；手工创建
-    ├── knowledge/                                 # 业务语义与示例问法目录；手工创建
-    │   ├── rules/                                 # 业务规则目录；手工创建
-    │   │   └── business-rules.md                  # 业务口径说明；手工创建
-    │   └── sql/                                   # 问法到 SQL 示例目录；手工创建
-    │       ├── revenue-by-member-level.md         # 示例问法与 SQL；手工创建
-    │       └── revenue-by-status.md               # 示例问法与 SQL；手工创建
-    ├── .wren/                                     # Wren 运行期目录；命令生成
-    │   └── memory/                                # Memory 索引目录；命令生成
-    └── target/                                    # 构建产物目录；命令生成
-        └── mdl.json                               # 编译后的 MDL；命令生成
-```
-
-说明：
-
-- `order-demo/` 是真正的 WrenAI 项目目录
-- `ask_service/` 是对外提供问数接口的服务目录
-- `.env`、`docker-compose.yml`、`mysql-init/` 只是辅助示例；如果你已经有业务 MySQL，可以不使用它们
+- 不要直接修改 `order-demo/`，新建一个单独的业务项目目录
+- 不要一开始就把数据库所有表都建模进来
+- 第一阶段只挑核心 10 到 30 张表上线
+- 优先建模：
+  - 核心事实表
+  - 关键维表
+  - 真实存在的主外键关系
+  - 高频问数涉及的字段
+- 强烈建议补充：
+  - `knowledge/rules/*.md`
+  - `knowledge/sql/*.md`
+- 强烈建议给 Wren 使用只读数据库账号
 
 ## 3. 前置条件
 
-请先确认以下环境已经具备：
+请先准备好下面这些信息：
 
-- Linux 服务器或开发机
+- GitHub 仓库地址
+- 新环境机器的登录账号
+- MySQL 连接信息
+  - `host`
+  - `port`
+  - `database`
+  - `user`
+  - `password`
+- vLLM OpenAI 兼容接口信息
+  - `VLLM_BASE_URL`
+  - `VLLM_API_KEY`
+  - `VLLM_MODEL`
+- `AgentVerse` 服务地址
+
+建议环境：
+
+- Linux
 - Python 3.11 或 3.12
-- 已有可访问的 MySQL 数据库
-- 已部署好的 vLLM OpenAI 兼容接口
-- `AgentVerse` 已经可用
+- 能访问 MySQL 和 vLLM
 
-建议先确认：
+## 4. 克隆源码
+
+下面以 `/home/lb/data` 为工作目录举例：
 
 ```bash
-python3 --version
-pip --version
+cd /home/lb/data
+git clone <你的-github-repo-url> AgentVerse_WrenAI
+cd /home/lb/data/AgentVerse_WrenAI
 ```
 
-如果还未安装基础依赖，可执行：
+后续文档默认：
+
+```bash
+export PROJECT_ROOT=/home/lb/data/AgentVerse_WrenAI
+```
+
+## 5. 安装系统依赖
+
+### 5.1 安装基础软件
 
 ```bash
 sudo apt update
@@ -122,137 +112,190 @@ sudo apt install -y \
   curl git
 ```
 
-## 4. 基于 pip 安装 WrenAI
-
-### 4.1 创建虚拟环境
+### 5.2 验证 Python
 
 ```bash
-cd /home/lb/data/AgentVerse_WrenAI
-python3.12 -m venv .venv
-source /home/lb/data/AgentVerse_WrenAI/.venv/bin/activate
+python3.12 --version
+pip --version
 ```
 
-### 4.2 安装 WrenAI
+## 6. 创建虚拟环境并安装依赖
+
+### 6.1 创建虚拟环境
+
+```bash
+cd "$PROJECT_ROOT"
+python3.12 -m venv .venv
+source "$PROJECT_ROOT/.venv/bin/activate"
+```
+
+### 6.2 安装 WrenAI
 
 ```bash
 pip install --upgrade pip setuptools wheel
 pip install "wrenai[mysql,memory,main]"
 ```
 
-如果网络较慢，可切换国内源：
+如果网络慢，可以使用镜像：
 
 ```bash
 pip install "wrenai[mysql,memory,main]" \
   -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
-### 4.3 验证安装
+### 6.3 安装 ask_service 依赖
+
+```bash
+pip install -r "$PROJECT_ROOT/ask_service/requirements.txt"
+```
+
+### 6.4 验证安装
 
 ```bash
 wren version
 wren docs connection-info mysql
 ```
 
-如果上面两条命令都能成功返回，说明 WrenAI 已安装完成。
+## 7. 为新业务库做接入准备
 
-## 5. 手工创建和配置 WrenAI 项目
+### 7.1 为 Wren 创建只读账号
 
-本节演示如何基于“已经存在的业务 MySQL”手工创建一个 Wren 项目。
+如果你有权限，建议给 Wren 单独创建一个只读账号。
 
-这里不会初始化任何测试数据，只关注这些工作：
+示例 SQL：
 
-- 创建目录
-- 创建配置文件
-- 创建模型文件
-- 创建关系文件
-- 创建可选的 cube 和 knowledge 文件
-
-为了方便说明，下面仍然使用两张示例表：
-
-- `customers`
-- `orders`
-
-并通过：
-
-- `orders.customer_id = customers.id`
-
-建立关系。
-
-如果你的业务表不同，请按同样结构替换。
-
-### 5.0 先理解“必选文件”和“可选文件”
-
-最小可运行的 Wren 项目，通常至少需要这些内容：
-
-**必须创建**
-
-- `order-demo/wren_project.yml`
-- `order-demo/connection_info.json`
-- `order-demo/models/<table>/metadata.yml`
-
-**通常也必须创建**
-
-- `order-demo/relationships.yml`
-
-说明：
-
-- 如果你的模型之间完全没有关联，可以把 `relationships.yml` 写成空数组
-- 但这个文件本身仍建议创建，这样项目结构更完整
-
-**可选但强烈建议创建**
-
-- `order-demo/knowledge/rules/business-rules.md`
-- `order-demo/knowledge/sql/*.md`
-
-说明：
-
-- 不创建 `knowledge`，Wren 仍然可以运行
-- 但自然语言问数效果通常会明显下降
-
-**可选创建**
-
-- `order-demo/cubes/*`
-- `order-demo/views/*`
-
-说明：
-
-- `cube` 适合固定口径聚合分析，不是 Wren 启动的硬性前提
-- `views` 适合封装复杂业务查询，不是示例项目必需项
-
-### 5.1 创建目录
-
-```bash
-mkdir -p /home/lb/data/AgentVerse_WrenAI/order-demo/views
-mkdir -p /home/lb/data/AgentVerse_WrenAI/order-demo/models/customers
-mkdir -p /home/lb/data/AgentVerse_WrenAI/order-demo/models/orders
-mkdir -p /home/lb/data/AgentVerse_WrenAI/order-demo/cubes/order_metrics
-mkdir -p /home/lb/data/AgentVerse_WrenAI/order-demo/knowledge/rules
-mkdir -p /home/lb/data/AgentVerse_WrenAI/order-demo/knowledge/sql
+```sql
+CREATE USER 'wren_reader'@'%' IDENTIFIED BY 'YourStrongPassword';
+GRANT SELECT ON your_database.* TO 'wren_reader'@'%';
+FLUSH PRIVILEGES;
 ```
 
-建议按下面的优先级理解这些目录：
+如果数据库权限由 DBA 管理，请让 DBA 提供一个只读账号。
 
-- `models/`：必须有
-- `relationships.yml`：通常要有
-- `knowledge/`：强烈建议有
-- `cubes/`：可选
-- `views/`：可选
+### 7.2 先盘点数据库结构
 
-### 5.2 创建连接文件
+不要直接对全库盲建模型。先导出表、字段、主键、关系候选。
 
-建议先复制模板文件：
+示例 SQL：
 
-```bash
-cp /home/lb/data/AgentVerse_WrenAI/order-demo/connection_info.example.json \
-   /home/lb/data/AgentVerse_WrenAI/order-demo/connection_info.json
+```sql
+SELECT
+  TABLE_NAME,
+  TABLE_COMMENT
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'your_database'
+ORDER BY TABLE_NAME;
 ```
 
-文件路径：
+```sql
+SELECT
+  TABLE_NAME,
+  COLUMN_NAME,
+  DATA_TYPE,
+  IS_NULLABLE,
+  COLUMN_KEY,
+  COLUMN_COMMENT
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA = 'your_database'
+ORDER BY TABLE_NAME, ORDINAL_POSITION;
+```
 
-- [connection_info.example.json](file:///home/lb/data/AgentVerse_WrenAI/order-demo/connection_info.example.json)
-- [connection_info.json](file:///home/lb/data/AgentVerse_WrenAI/order-demo/connection_info.json)
+```sql
+SELECT
+  TABLE_NAME,
+  INDEX_NAME,
+  COLUMN_NAME
+FROM information_schema.STATISTICS
+WHERE TABLE_SCHEMA = 'your_database'
+ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX;
+```
 
-示例内容：
+```sql
+SELECT
+  TABLE_NAME,
+  REFERENCED_TABLE_NAME,
+  COLUMN_NAME,
+  REFERENCED_COLUMN_NAME
+FROM information_schema.KEY_COLUMN_USAGE
+WHERE TABLE_SCHEMA = 'your_database'
+  AND REFERENCED_TABLE_NAME IS NOT NULL
+ORDER BY TABLE_NAME, COLUMN_NAME;
+```
+
+建议把这些结果保存成 CSV 或 Excel，方便后续建模。
+
+### 7.3 第一阶段只选核心表
+
+如果你的数据库表很多，推荐先选 10 到 30 张最核心的表做第一版问数。
+
+优先选择：
+
+- 主事实表
+- 关键维表
+- 高频分析表
+- 有明确主键和关系的表
+
+不建议首期直接纳入：
+
+- 日志表
+- 任务中间表
+- 临时同步表
+- 历史归档表
+- 命名混乱且业务含义不明的表
+
+## 8. 创建你的 Wren 项目目录
+
+不要直接改 `order-demo/`。推荐新建一个独立目录。
+
+下面假设你的业务项目名是 `biz-analytics`：
+
+```bash
+export WREN_PROJECT_NAME=biz-analytics
+export WREN_PROJECT_DIR="$PROJECT_ROOT/$WREN_PROJECT_NAME"
+```
+
+创建目录：
+
+```bash
+mkdir -p "$WREN_PROJECT_DIR/models"
+mkdir -p "$WREN_PROJECT_DIR/cubes"
+mkdir -p "$WREN_PROJECT_DIR/views"
+mkdir -p "$WREN_PROJECT_DIR/knowledge/rules"
+mkdir -p "$WREN_PROJECT_DIR/knowledge/sql"
+```
+
+推荐最终目录结构如下：
+
+```text
+AgentVerse_WrenAI/
+├── ask_service/
+├── order-demo/                          # 示例项目，保留参考，不作为你的正式业务模型
+└── biz-analytics/                       # 你的新业务 Wren 项目
+    ├── connection_info.json
+    ├── wren_project.yml
+    ├── relationships.yml
+    ├── models/
+    ├── cubes/
+    ├── views/
+    ├── knowledge/
+    │   ├── rules/
+    │   └── sql/
+    ├── .wren/                           # 运行后生成
+    └── target/                          # 构建后生成
+```
+
+## 9. 配置 Wren 项目基础文件
+
+### 9.1 创建 `connection_info.json`
+
+你可以直接参考示例模板：
+
+```bash
+cp "$PROJECT_ROOT/order-demo/connection_info.example.json" \
+   "$WREN_PROJECT_DIR/connection_info.json"
+```
+
+然后把内容改成你的数据库：
 
 ```json
 {
@@ -260,445 +303,360 @@ cp /home/lb/data/AgentVerse_WrenAI/order-demo/connection_info.example.json \
   "host": "127.0.0.1",
   "port": 3306,
   "database": "your_database",
-  "user": "your_user",
-  "password": "your_password"
+  "user": "your_readonly_user",
+  "password": "your_readonly_password"
 }
 ```
 
-请按你的 MySQL 实际连接信息修改：
-
-- `host`
-- `port`
-- `database`
-- `user`
-- `password`
-
-建议给 Wren 单独创建只读账号。
-
-如果你接的是现有业务数据库，这一步是最先要完成的配置项之一。
-
-### 5.3 创建项目主配置
-
-文件路径：
-
-- [wren_project.yml](file:///home/lb/data/AgentVerse_WrenAI/order-demo/wren_project.yml)
+### 9.2 创建 `wren_project.yml`
 
 示例内容：
 
 ```yaml
 schema_version: 5
-name: order_demo
+name: biz_analytics
 version: "0.1.0"
 catalog: wren
 schema: public
 data_source: mysql
 ```
 
-### 5.4 创建模型文件
+说明：
 
-模型文件按表拆分，每张表一个目录。
+- `name` 建议使用业务上能识别的项目名
+- `data_source` 对 MySQL 固定写 `mysql`
 
-#### customers 模型
+### 9.3 创建 `relationships.yml`
 
-文件路径：
+如果当前还没梳理好关系，建议先创建空文件结构：
 
-- [customers/metadata.yml](file:///home/lb/data/AgentVerse_WrenAI/order-demo/models/customers/metadata.yml)
+```yaml
+relationships: []
+```
 
-这个文件定义：
+后续确认真实关系后再补。
 
-- 表名
-- 主键
-- 字段类型
-- 字段描述
+## 10. 创建 `models/`
 
-#### orders 模型
+### 10.1 一张表对应一个模型目录
 
-文件路径：
+例如你选择了下面两张核心表：
 
-- [orders/metadata.yml](file:///home/lb/data/AgentVerse_WrenAI/order-demo/models/orders/metadata.yml)
+- `fact_order`
+- `dim_customer`
 
-这个文件定义：
+则目录可以这样建：
 
-- 订单事实表
-- 订单字段
-- 与客户表关联的 `customer_id`
+```bash
+mkdir -p "$WREN_PROJECT_DIR/models/fact_order"
+mkdir -p "$WREN_PROJECT_DIR/models/dim_customer"
+```
 
-### 5.5 创建关系文件
+### 10.2 模型文件模板
 
-文件路径：
+每张表一个 `metadata.yml`。
 
-- [relationships.yml](file:///home/lb/data/AgentVerse_WrenAI/order-demo/relationships.yml)
+模板如下：
 
-当前示例内容：
+```yaml
+name: fact_order
+table_reference:
+  schema: your_database
+  table: fact_order
+properties:
+  description: 订单事实表，一行代表一笔订单。
+columns:
+  - name: id
+    type: BIGINT
+    is_calculated: false
+    not_null: true
+    is_primary_key: true
+    properties:
+      description: 订单主键
+  - name: customer_id
+    type: BIGINT
+    is_calculated: false
+    not_null: false
+    properties:
+      description: 客户 ID，关联 dim_customer.id
+  - name: order_amount
+    type: DOUBLE
+    is_calculated: false
+    not_null: false
+    properties:
+      description: 订单金额
+  - name: created_at
+    type: TIMESTAMP
+    is_calculated: false
+    not_null: false
+    properties:
+      description: 下单时间
+primary_key: id
+cached: false
+```
+
+### 10.3 类型映射建议
+
+MySQL 常见类型可按下面思路映射：
+
+- `int / integer` -> `INTEGER`
+- `bigint` -> `BIGINT`
+- `decimal / numeric / double / float` -> `DOUBLE`
+- `varchar / char / text` -> `VARCHAR`
+- `datetime / timestamp` -> `TIMESTAMP`
+- `date` -> `DATE`
+- `tinyint(1)` -> 视业务决定是否映射成 `BOOLEAN`
+
+如果不确定，优先保持与示例风格一致，先保证可运行，再逐步校正。
+
+### 10.4 编写字段描述的原则
+
+字段描述会直接影响问数准确率。
+
+建议优先写清楚：
+
+- 主键和外键含义
+- 金额字段口径
+- 时间字段口径
+- 状态字段取值含义
+- 地区、组织、租户字段含义
+
+## 11. 创建关系文件
+
+如果数据库中存在明确关系，请写入 `relationships.yml`。
+
+示例：
 
 ```yaml
 relationships:
-  - name: orders_customer
+  - name: fact_order_customer
     models:
-      - orders
-      - customers
+      - fact_order
+      - dim_customer
     join_type: MANY_TO_ONE
-    condition: orders.customer_id = customers.id
+    condition: fact_order.customer_id = dim_customer.id
 ```
 
-如果你的业务表之间存在外键或稳定的主从关系，建议明确写进 `relationships.yml`。
+编写原则：
 
-核心原则是：
+- 只写真实存在的关系
+- 不要凭字段名猜关系
+- 高优先级先建高频问数会用到的关联
 
-- 只写真实存在且业务含义明确的关系
-- 不要凭字段名臆造关系
-- 优先建模高频查询中会用到的关联关系
+## 12. 创建 `knowledge/` 以提升准确率
 
-### 5.6 创建 cube 文件
+### 12.1 业务规则文件
 
-文件路径：
+文件：
 
-- [order_metrics/metadata.yml](file:///home/lb/data/AgentVerse_WrenAI/order-demo/cubes/order_metrics/metadata.yml)
+```text
+$WREN_PROJECT_DIR/knowledge/rules/business-rules.md
+```
 
-当前示例中定义了：
+建议至少写清楚：
 
-- `total_revenue`
-- `order_count`
-- `avg_order_amount`
+- 收入口径
+- 有效订单口径
+- 默认时间字段
+- 状态字段含义
+- 地区字段来源
 
-以及常见维度：
+示例：
 
-- `product_category`
-- `order_status`
-- `payment_method`
-- `region`
+```md
+## 指标口径
 
-以及时间维：
+- revenue 指已支付订单金额，统一使用 `fact_order.pay_amount`
+- order count 指有效订单数，不包含取消订单
+- 默认时间分析字段使用 `fact_order.created_at`
 
-- `created_at`
+## 维度口径
 
-#### cube 文件是不是必须创建
+- 客户地区统一使用 `dim_customer.region_name`
+- 渠道统一使用 `fact_order.channel_name`
 
-不是必须。
+## 状态约定
 
-如果只是为了让 Wren 能完成：
+- `PAID` 表示已支付
+- `CANCELLED` 表示已取消
+- `REFUNDED` 表示已退款
+```
 
-- `context validate`
-- `context build`
-- `memory index`
-- `wren --sql`
+### 12.2 示例 SQL 文件
 
-那么没有 cube 也可以。
+目录：
 
-但如果你的问数场景经常涉及：
+```text
+$WREN_PROJECT_DIR/knowledge/sql/
+```
 
-- 收入汇总
-- 订单量统计
-- 趋势分析
-- 按地区、按状态、按品类聚合
+示例文件：
 
-那么建议创建 cube，因为它可以把高频的聚合逻辑提前结构化，减少大模型自由拼 SQL 的不稳定性。
+```md
+---
+nl: 按客户地区统计订单数和销售额
+sql: |
+  SELECT
+    c.region_name,
+    COUNT(*) AS order_count,
+    SUM(o.pay_amount) AS total_revenue
+  FROM "fact_order" o
+  JOIN "dim_customer" c ON o.customer_id = c.id
+  WHERE o.order_status <> 'CANCELLED'
+  GROUP BY 1
+  ORDER BY total_revenue DESC
+source: seed
+tags:
+  - revenue
+  - region
+  - order
+---
+```
 
-#### 什么情况下建议创建 cube
+建议首批至少沉淀 10 到 20 个高频问题示例。
 
-满足以下任意情况时，建议创建：
+## 13. 可选创建 `cubes/`
 
-- 有明显的事实表，比如订单表、流水表、交易表
-- 需要频繁做 `SUM/COUNT/AVG`
-- 需要按时间、地区、状态、品类做聚合
-- 某些统计口径相对稳定，经常重复使用
+如果你的场景经常做聚合分析，推荐增加 cube。
 
-#### 创建 cube 的核心原则
+典型适合做 cube 的主题：
 
-- 一个 cube 通常围绕一个核心事实对象建立
-  - 例如：`orders` -> `order_metrics`
-- `measures` 只放稳定、可复用的指标
-  - 例如：`total_revenue`、`order_count`、`avg_order_amount`
-- `dimensions` 放经常用于分组分析的字段
-  - 例如：地区、状态、支付方式、品类
-- `time_dimensions` 放默认的时间分析字段
-  - 例如：`created_at`
-- 不要把所有字段都塞进 cube
-  - cube 是“常用统计视角”，不是模型字段的简单复制
+- 销售统计
+- 订单统计
+- 用户增长
+- 库存分析
+- 财务汇总
 
-#### 创建 cube 时建议优先挑哪些字段
+如果只是先打通最小链路，`cube` 不是硬性前提。
 
-优先挑这几类：
+## 14. 构建 Wren 项目
 
-- 指标字段
-  - `amount`
-  - `price`
-  - `revenue`
-  - `qty`
-- 维度字段
-  - `status`
-  - `region`
-  - `category`
-  - `channel`
-- 时间字段
-  - `created_at`
-  - `paid_at`
-  - `biz_date`
-
-#### 示例 cube 的理解方式
-
-当前示例 [order_metrics/metadata.yml](file:///home/lb/data/AgentVerse_WrenAI/order-demo/cubes/order_metrics/metadata.yml) 的设计逻辑是：
-
-- `base_object: orders`
-  - 表示围绕订单事实表建立聚合
-- `total_revenue`
-  - 用 `SUM(total_amount)` 表示收入
-- `order_count`
-  - 用 `COUNT(*)` 表示订单数
-- `avg_order_amount`
-  - 用 `AVG(total_amount)` 表示客单价
-- `dimensions`
-  - 选择最常见的统计维度
-- `time_dimensions`
-  - 使用 `created_at` 作为默认时间轴
-
-### 5.7 创建业务规则和示例 SQL
-
-规则文件路径：
-
-- [business-rules.md](file:///home/lb/data/AgentVerse_WrenAI/order-demo/knowledge/rules/business-rules.md)
-
-示例 SQL 文件路径：
-
-- [revenue-by-status.md](file:///home/lb/data/AgentVerse_WrenAI/order-demo/knowledge/sql/revenue-by-status.md)
-- [revenue-by-member-level.md](file:///home/lb/data/AgentVerse_WrenAI/order-demo/knowledge/sql/revenue-by-member-level.md)
-
-这两类文件的作用分别是：
-
-- `rules`：定义业务口径、字段含义、默认时间字段
-- `sql`：沉淀常见问法与正确 SQL
-
-#### 这两类文件是不是必须创建
-
-严格来说不是必须，但非常推荐创建。
-
-原因是：
-
-- 没有 `rules`，模型只知道字段结构，不知道你的业务口径
-- 没有 `sql` 示例，`memory recall` 和 ask_service 很难稳定命中历史正确问法
-
-#### `business-rules.md` 的核心作用
-
-这个文件主要解决“业务含义”问题，而不是“数据库结构”问题。
-
-推荐写这几类内容：
-
-- 指标口径
-  - revenue 是什么
-  - order count 怎么算
-- 时间口径
-  - 默认按 `created_at` 还是 `paid_at`
-- 状态口径
-  - `PAID`、`COMPLETED`、`REFUNDED` 的业务含义
-- 维度口径
-  - 地区取客户地区还是订单地区
-
-#### 编写 `business-rules.md` 的核心原则
-
-- 只写“会影响 SQL 生成和结果解释”的规则
-- 只写“业务口径”，不要重复字段结构定义
-- 优先写容易误解的概念
-  - 收入
-  - 有效订单
-  - 时间字段
-  - 退款是否计入
-- 语言尽量明确，避免模糊描述
-
-#### `knowledge/sql/*.md` 的核心作用
-
-这些文件用来沉淀：
-
-- 常见业务问法
-- 对应的正确 SQL
-
-它会直接影响：
-
-- `wren memory recall`
-- ask_service 的历史示例召回效果
-- NL2SQL 的稳定性
-
-#### 编写 SQL 示例文件的核心原则
-
-- 只保存“已经确认正确”的 SQL
-- 一条文件对应一种清晰问法
-- 问法尽量贴近真实业务用户的表达
-- SQL 尽量简洁、稳定、可复用
-- 优先沉淀高频问题
-
-推荐优先沉淀这几类问题：
-
-- 按状态统计销售额
-- 按地区统计订单数
-- 按会员等级统计收入
-- 按月份统计趋势
-- 最近 7 天 / 30 天统计
-
-#### 什么时候优先补 `rules`，什么时候优先补 `sql`
-
-- 如果问题主要是“模型不懂业务含义”
-  - 优先补 `rules`
-- 如果问题主要是“某些常见问法老是生成错 SQL”
-  - 优先补 `knowledge/sql`
-
-### 5.8 构建 Wren 项目
+### 14.1 校验与构建
 
 ```bash
-source /home/lb/data/AgentVerse_WrenAI/.venv/bin/activate
-cd /home/lb/data/AgentVerse_WrenAI/order-demo
+source "$PROJECT_ROOT/.venv/bin/activate"
+cd "$WREN_PROJECT_DIR"
 
 wren context validate
 wren context build
 ```
 
-执行成功后，会生成：
+成功后会生成：
 
-- [mdl.json](file:///home/lb/data/AgentVerse_WrenAI/order-demo/target/mdl.json)
+- `target/mdl.json`
 
-### 5.9 建立 Memory 索引
+### 14.2 建立 Memory 索引
 
 ```bash
-source /home/lb/data/AgentVerse_WrenAI/.venv/bin/activate
-cd /home/lb/data/AgentVerse_WrenAI/order-demo
+source "$PROJECT_ROOT/.venv/bin/activate"
+cd "$WREN_PROJECT_DIR"
 
 export HF_ENDPOINT=https://hf-mirror.com
-wren memory index --mdl /home/lb/data/AgentVerse_WrenAI/order-demo/target/mdl.json
+wren memory index --mdl "$WREN_PROJECT_DIR/target/mdl.json"
 ```
 
 说明：
 
-- 第一次执行时，`MemoryStore` 可能会下载并初始化向量模型
-- 首次构建会比较慢，属于正常现象
+- 首次执行可能会下载并初始化嵌入模型
+- 首次比较慢是正常现象
+- 执行完成后会生成 `.wren/memory/`
 
-执行后会生成：
+### 14.3 本地向量模型部署要求
 
-- `order-demo/.wren/memory/`
+为了避免 `wren memory index` 或 `ask_service` 在初始化 `MemoryStore` 时再次走在线 Hugging Face 请求，推荐把 embedding 模型提前准备到本机。
 
-### 5.10 手工验证 Wren 功能
+当前默认向量模型是：
 
-下面的 SQL 与 Cube 示例仍基于 `customers` 和 `orders` 两张演示表。
+- `paraphrase-multilingual-MiniLM-L12-v2`
 
-如果你的业务数据库使用的是其他表，请把示例 SQL 改成你自己的表和字段。
+推荐做法：
 
-#### 基础 SQL 查询
+1. 在服务器上先执行一次 `wren memory index`
+2. 等模型被下载到本机 Hugging Face 缓存后，再启动 `ask_service`
+3. 让 `ask_service` 优先使用本地 snapshot，而不是在线模型名
 
-```bash
-wren --mdl /home/lb/data/AgentVerse_WrenAI/order-demo/target/mdl.json \
-  --connection-file /home/lb/data/AgentVerse_WrenAI/order-demo/connection_info.json \
-  --sql 'SELECT COUNT(*) AS total_orders FROM "orders"' \
-  --output json
-```
-
-#### 跨表查询
+如果你所在环境访问 Hugging Face 较慢，可以先设置镜像：
 
 ```bash
-wren --mdl /home/lb/data/AgentVerse_WrenAI/order-demo/target/mdl.json \
-  --connection-file /home/lb/data/AgentVerse_WrenAI/order-demo/connection_info.json \
-  --sql 'SELECT c.member_level, COUNT(*) AS order_count, SUM(o.total_amount) AS total_revenue FROM "orders" o JOIN "customers" c ON o.customer_id = c.id GROUP BY 1 ORDER BY total_revenue DESC' \
-  --output json
+export HF_ENDPOINT=https://hf-mirror.com
 ```
 
-#### Cube 查询
+默认情况下，当前版本的 `ask_service` 会按下面顺序自动解析本地向量模型：
 
-```bash
-wren cube query \
-  --mdl /home/lb/data/AgentVerse_WrenAI/order-demo/target/mdl.json \
-  --connection-file /home/lb/data/AgentVerse_WrenAI/order-demo/connection_info.json \
-  --cube order_metrics \
-  --measures total_revenue,order_count \
-  --dimensions order_status \
-  --output json
-```
+1. `WREN_EMBEDDING_MODEL_LOCAL_PATH`
+2. `WREN_EMBEDDING_MODEL` 如果本身就是本地目录
+3. Hugging Face 本地缓存中的 `snapshot` 目录
+4. 最后才回退为模型名在线加载
 
-#### Memory 召回
-
-```bash
-wren memory recall -q "按客户会员等级统计销售额"
-```
-
-如果以上测试都正常，说明 WrenAI 核心功能已可用。
-
-## 6. 启动和测试 ask_service
-
-`ask_service` 用于把：
-
-- WrenAI
-- vLLM
-- 自然语言问数
-
-三者串起来，并通过 HTTP 暴露给 AgentVerse。
-
-### 6.1 安装 ask_service 依赖
-
-```bash
-source /home/lb/data/AgentVerse_WrenAI/.venv/bin/activate
-pip install -r /home/lb/data/AgentVerse_WrenAI/ask_service/requirements.txt
-```
-
-依赖文件路径：
-
-- [requirements.txt](file:///home/lb/data/AgentVerse_WrenAI/ask_service/requirements.txt)
-
-### 6.2 配置 ask_service
-
-建议先复制模板文件：
-
-```bash
-cp /home/lb/data/AgentVerse_WrenAI/ask_service/.env.example \
-   /home/lb/data/AgentVerse_WrenAI/ask_service/.env
-```
-
-配置文件路径：
-
-- [.env.example](file:///home/lb/data/AgentVerse_WrenAI/ask_service/.env.example)
-- [.env](file:///home/lb/data/AgentVerse_WrenAI/ask_service/.env)
-
-当前配置项如下：
+如果你想显式指定本地模型目录，可填写类似路径：
 
 ```dotenv
-# ask_service 监听地址；通常本机部署保持 127.0.0.1 即可
-ASK_HOST=127.0.0.1
-
-# ask_service 监听端口；需要与 AgentVerse HTTP 节点填写的端口一致
-ASK_PORT=18082
-
-# vLLM 的 OpenAI 兼容接口地址；ask_service 通过它调用大模型
-VLLM_BASE_URL=http://127.0.0.1:8000/v1
-
-# vLLM 的 API Key；如果你的服务不校验，可保留 dummy；如果校验，请填写真实值
-VLLM_API_KEY=your-api-key
-
-# ask_service 调用的大模型名称；必须与 /v1/models 返回的模型名一致
-VLLM_MODEL=your-model-name
-
-# Wren 项目根目录；相对 AgentVerse_WrenAI 根目录解析
-WREN_PROJECT_PATH=order-demo
-
-# Wren 编译后的 mdl.json 路径；相对 AgentVerse_WrenAI 根目录解析
-WREN_MDL_PATH=order-demo/target/mdl.json
-
-# Wren 连接数据库用的 connection_info.json 路径；相对 AgentVerse_WrenAI 根目录解析
-WREN_CONN_FILE=order-demo/connection_info.json
-
-# Wren Memory 索引目录；相对 AgentVerse_WrenAI 根目录解析
-WREN_MEMORY_PATH=order-demo/.wren/memory
-
-# 是否开启 Wren 严格模式；true 表示只允许查询 MDL 中定义的对象，推荐开启
-WREN_STRICT_MODE=true
-
-# 单次问数请求的超时时间（秒）；包含 LLM 调用和 SQL 执行
-QUERY_TIMEOUT_SEC=90
-
-# 单次 SQL 最多返回多少行；避免结果集过大
-MAX_RESULT_ROWS=200
-
-# Memory recall 默认召回多少条相似问法
-DEFAULT_RECALL_LIMIT=3
-
-# Memory fetch 默认返回多少条上下文结果
-DEFAULT_FETCH_LIMIT=6
+WREN_EMBEDDING_MODEL_LOCAL_PATH=/home/your_user/.cache/huggingface/hub/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/snapshots/<revision>
 ```
 
-你需要重点确认：
+如果本机已经存在模型缓存，可以用下面命令查看：
+
+```bash
+ls ~/.cache/huggingface/hub/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/snapshots
+```
+
+说明：
+
+- `ask_service` 已支持优先使用本地 snapshot 路径
+- 这样可以保留向量召回能力，同时避免在线下载导致的初始化失败
+- 新机器部署时，建议先把 embedding 模型下载好，再进行联调
+
+### 14.4 先做基础连通验证
+
+建议先用真实 SQL 做连通测试：
+
+```bash
+wren --mdl "$WREN_PROJECT_DIR/target/mdl.json" \
+  --connection-file "$WREN_PROJECT_DIR/connection_info.json" \
+  --sql 'SELECT COUNT(*) AS total_rows FROM "fact_order"' \
+  --output json
+```
+
+如果有跨表关系，再做一个 join 测试。
+
+## 15. 配置 `ask_service`
+
+### 15.1 复制配置模板
+
+```bash
+cp "$PROJECT_ROOT/ask_service/.env.example" \
+   "$PROJECT_ROOT/ask_service/.env"
+```
+
+### 15.2 按你的新项目修改 `.env`
+
+示例：
+
+```dotenv
+ASK_HOST=127.0.0.1
+ASK_PORT=18082
+
+VLLM_BASE_URL=http://127.0.0.1:8000/v1
+VLLM_API_KEY=your-api-key
+VLLM_MODEL=your-model-name
+
+WREN_PROJECT_PATH=biz-analytics
+WREN_MDL_PATH=biz-analytics/target/mdl.json
+WREN_CONN_FILE=biz-analytics/connection_info.json
+WREN_MEMORY_PATH=biz-analytics/.wren/memory
+
+WREN_EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2
+# WREN_EMBEDDING_MODEL_LOCAL_PATH=/home/your_user/.cache/huggingface/hub/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/snapshots/<revision>
+
+WREN_STRICT_MODE=true
+QUERY_TIMEOUT_SEC=90
+MAX_RESULT_ROWS=200
+DEFAULT_RECALL_LIMIT=3
+DEFAULT_FETCH_LIMIT=6
+CONTEXT_THRESHOLD=30000
+```
+
+重点确认：
 
 - `VLLM_BASE_URL`
 - `VLLM_API_KEY`
@@ -707,179 +665,84 @@ DEFAULT_FETCH_LIMIT=6
 - `WREN_MDL_PATH`
 - `WREN_CONN_FILE`
 - `WREN_MEMORY_PATH`
+- `WREN_EMBEDDING_MODEL`
+- `WREN_EMBEDDING_MODEL_LOCAL_PATH`
 
-说明：
+## 16. 启动与验证 `ask_service`
 
-- 这些 Wren 路径是相对 `AgentVerse_WrenAI` 根目录解析的
-- 不需要写绝对路径
+### 16.1 启动 vLLM
 
-### 6.3 启动 vLLM
-
-如果 vLLM 尚未启动，请先启动你的 OpenAI 兼容模型服务。
-
-启动后验证：
+如果你的 vLLM 未启动，先启动它，并验证：
 
 ```bash
 curl http://127.0.0.1:8000/v1/models
 ```
 
-### 6.4 启动 ask_service
+### 16.2 启动 ask_service
 
 ```bash
-source /home/lb/data/AgentVerse_WrenAI/.venv/bin/activate
-cd /home/lb/data/AgentVerse_WrenAI/ask_service
+source "$PROJECT_ROOT/.venv/bin/activate"
+cd "$PROJECT_ROOT/ask_service"
 python main.py
 ```
 
 说明：
 
-- 启动入口会读取 `ask_service/.env` 中的 `ASK_HOST` 与 `ASK_PORT`
-- `workers` 固定为 `1`，不要改大
-- 首次启动如果卡在 `Waiting for application startup`，通常是 `MemoryStore` 首次加载模型
+- 启动入口会读取 `ask_service/.env`
+- 当前版本中，MemoryStore 改为后台预热
+- 所以服务通常会先起来，Memory 预热期间 `/status` 可能显示 `warming_up`
 
-服务主文件：
-
-- [app.py](file:///home/lb/data/AgentVerse_WrenAI/ask_service/app.py)
-
-### 6.5 健康检查
+### 16.3 健康检查
 
 ```bash
 curl http://127.0.0.1:18082/health
 ```
 
-### 6.6 状态检查
+### 16.4 状态检查
 
 ```bash
 curl http://127.0.0.1:18082/status
 ```
 
-### 6.7 重新索引
+重点看：
 
-当你修改了：
+- `memory_state`
+- `memory_init_error`
+- `query_timeout_sec`
+- `embedding_model_source`
+- `embedding_model_resolved`
 
-- `models/`
-- `relationships.yml`
-- `knowledge/`
+说明：
 
-之后，可以执行：
+- `memory_state=warming_up` 表示服务已启动，但 Memory 仍在后台预热
+- `memory_state=ready` 表示问数已基本可用
+- `embedding_model_source=local_path` 表示当前向量模型已走本地目录加载
+- `embedding_model_resolved` 会显示最终生效的本地 snapshot 路径或模型名
 
-```bash
-curl -X POST http://127.0.0.1:18082/admin/reindex
-```
+### 16.5 问数测试
 
-### 6.8 测试问数接口
-
-#### 测试 1：会员等级统计
-
-```bash
-curl -X POST http://127.0.0.1:18082/api/ask \
-  -H "Content-Type: application/json" \
-  -d '{
-    "question": "按客户会员等级统计销售额和订单数"
-  }'
-```
-
-#### 测试 2：按地区统计
+建议先用一条你已经确认答案的真实业务问题：
 
 ```bash
 curl -X POST http://127.0.0.1:18082/api/ask \
   -H "Content-Type: application/json" \
   -d '{
-    "question": "按客户地区统计销售额和订单数"
+    "question": "按客户地区统计订单数和销售额"
   }'
 ```
 
-#### 测试 3：限制地区
+如果返回：
 
-```bash
-curl -X POST http://127.0.0.1:18082/api/ask \
-  -H "Content-Type: application/json" \
-  -d '{
-    "question": "统计销售额和订单数",
-    "allowed_regions": ["华东", "华北"]
-  }'
-```
+- `200` 且 `ok=true`，说明问数成功
+- `503` 且 `error.code=MEMORY_WARMING_UP`，说明服务已启动，但 Memory 还没预热完成
 
-### 6.9 ask_service 返回结果说明
+## 17. 在 AgentVerse 中配置 HTTP 节点
 
-正常返回示例字段：
+### 17.1 HTTP 节点基本配置
 
-- `ok`
-- `trace_id`
-- `need_clarification`
-- `sql`
-- `rows`
-- `summary`
-- `chart`
-- `latency_ms`
-
-重点判断：
-
-- `ok=true` 表示成功
-- `need_clarification=true` 表示还需要补充查询条件
-- `sql` 表示最终执行的 SQL
-- `rows` 表示结构化结果
-- `summary` 表示给用户展示的自然语言答案
-
-### 6.10 查看日志
-
-`app.py` 已经内置了：
-
-- 启动日志
-- 请求日志
-- SQL 执行耗时日志
-
-前台启动时，直接在终端里查看即可。
-
-重点关注以下事件：
-
-- `startup_memory_ready`
-- `startup_completed`
-- `ask_request_received`
-- `ask_context_ready`
-- `sql_dry_run_finished`
-- `sql_query_finished`
-- `ask_request_completed`
-- `ask_request_failed`
-
-## 7. 如何在 AgentVerse 中进行配置和测试
-
-### 7.1 使用方式
-
-在 AgentVerse 中，推荐通过工作流的 HTTP 节点调用：
-
-- `http://127.0.0.1:18082/api/ask`
-
-当前项目已放开 AgentVerse HTTP 节点对本地地址的访问限制，因此可以直接调用本机地址。
-
-### 7.2 推荐工作流结构
-
-建议建立一个“数据问答”工作流，结构如下：
-
-```text
-开始节点
-  -> HTTP 请求节点（调用 ask_service）
-  -> 条件分支节点（判断 need_clarification）
-  -> 回复节点
-```
-
-也可以加一个 AI 节点做润色，但不是必须。
-
-### 7.3 HTTP 节点配置
-
-#### URL
-
-```text
-http://127.0.0.1:18082/api/ask
-```
-
-#### Method
-
-```text
-POST
-```
-
-#### Headers
+- URL：`http://127.0.0.1:18082/api/ask`
+- Method：`POST`
+- Headers：
 
 ```json
 {
@@ -887,9 +750,18 @@ POST
 }
 ```
 
-#### Body
+- Timeout：`90`
 
-把当前用户输入映射到 `question`：
+填写说明：
+
+- 如果 `AgentVerse` 与 `ask_service` 在同一台机器，可直接用 `http://127.0.0.1:18082/api/ask`
+- 如果不在同一台机器，请改成 `ask_service` 所在机器可访问地址，例如 `http://10.0.0.15:18082/api/ask`
+- HTTP 节点的 `Timeout` 必须大于或等于 `ask_service/.env` 中的 `QUERY_TIMEOUT_SEC`
+- 当前项目默认 `QUERY_TIMEOUT_SEC=90`，因此 HTTP 节点建议也填 `90` 或更大
+
+### 17.2 请求体
+
+最简单配置：
 
 ```json
 {
@@ -897,7 +769,7 @@ POST
 }
 ```
 
-如果你希望加区域过滤，也可以这样传：
+如果你还要加区域限制：
 
 ```json
 {
@@ -906,140 +778,273 @@ POST
 }
 ```
 
-### 7.4 条件分支节点
+如果你的工作流里用户问题来自上游节点变量，也可以直接把变量替换到 `question` 字段，例如：
 
-判断 ask_service 返回值中的：
+```json
+{
+  "question": "{{input}}"
+}
+```
 
-- `need_clarification`
+要求：
 
-如果为 `true`：
+- 请求体必须是合法 JSON
+- `question` 是必填字段
+- `allowed_regions` 是可选字段，类型必须是字符串数组
 
-- 回复 `clarification_question`
+### 17.3 成功返回字段
 
-如果为 `false`：
+`ask_service` 成功时会返回 `HTTP 200`，典型字段如下：
 
-- 回复 `summary`
+```json
+{
+  "ok": true,
+  "trace_id": "xxx",
+  "need_clarification": false,
+  "clarification_question": "",
+  "question": "按客户地区统计订单数和销售额",
+  "sql": "SELECT ...",
+  "rows": [],
+  "summary": "",
+  "chart": {
+    "type": "table",
+    "xField": "",
+    "yField": ""
+  },
+  "latency_ms": 1234,
+  "error": null
+}
+```
 
-### 7.5 回复节点建议
+在 `AgentVerse` 的 HTTP 节点后续节点中，通常可使用：
 
-回复给用户时，建议直接使用：
+- `httpResult.ok`
+- `httpResult.need_clarification`
+- `httpResult.clarification_question`
+- `httpResult.sql`
+- `httpResult.rows`
+- `httpResult.chart`
+- `httpResult.latency_ms`
 
-- `summary`
+说明：
 
-如果你需要调试，也可以在后台显示：
+- 当前 `ask_service` 不再调用 `llm_summary` 生成自然语言总结
+- `summary` 字段仍保留，但成功场景下默认返回空字符串以保持响应结构兼容
+- 推荐在 `AgentVerse` 的下游 AI 对话节点中直接使用 `httpResult.question`、`httpResult.sql`、`httpResult.rows`、`httpResult.chart` 生成最终回复
 
-- `sql`
-- `rows`
-- `trace_id`
+### 17.4 失败返回字段与错误处理
 
-### 7.6 在 AgentVerse 中测试
+`ask_service` 失败时不会再固定返回 `200`，而是按场景返回正确状态码。
 
-推荐测试问题：
+常见情况：
 
-- `按客户会员等级统计销售额和订单数`
-- `按客户地区统计销售额和订单数`
-- `按月份统计订单数和销售额趋势`
-- `华东地区订单销售额是多少`
+- `400`：规划结果非法、SQL 不安全、请求内容不合法
+- `422`：请求体缺字段或字段类型错误
+- `503`：大模型服务异常，或 `MemoryStore` 还未就绪
+- `504`：整体请求、LLM 调用或 SQL 执行超时
+- `500`：服务内部未分类异常
 
-期望结果：
+失败响应体中通常仍会返回结构化 JSON，例如：
 
-- 工作流能成功调用 ask_service
-- ask_service 返回结构化 JSON
-- AgentVerse 正确显示 `summary`
-- 对需要补充条件的问题，能提示用户继续补充
+```json
+{
+  "ok": false,
+  "trace_id": "xxx",
+  "need_clarification": false,
+  "clarification_question": "",
+  "question": "按客户地区统计订单数和销售额",
+  "sql": "",
+  "rows": [],
+  "summary": "",
+  "chart": {
+    "type": "table",
+    "xField": "",
+    "yField": ""
+  },
+  "latency_ms": 120,
+  "error": {
+    "code": "MEMORY_WARMING_UP",
+    "message": "MemoryStore 仍在预热，请稍后重试"
+  }
+}
+```
 
-## 8. 常见问题
+如果 HTTP 节点配置正确，后续分支建议优先判断：
 
-### 8.1 `wren memory index` 很慢
+- `httpResult.need_clarification`
+- `httpResult.ok`
+- `errorText`
 
-原因：
+建议逻辑：
 
-- 首次会下载并初始化向量模型
+- 如果 `httpResult.need_clarification=true`，回复 `httpResult.clarification_question`
+- 如果 `httpResult.ok=true`，回复 `httpResult.summary`
+- 如果 `errorText` 非空，进入错误提示或重试分支
+- 如果 `httpResult.ok=false`，可进一步读取 `httpResult.error.code` 和 `httpResult.error.message`
+
+### 17.5 推荐的 HTTP 节点配置模板
+
+你可以直接按下面的模板在 `AgentVerse` 中填写：
+
+- URL：`http://127.0.0.1:18082/api/ask`
+- Method：`POST`
+- Headers：
+
+```json
+{
+  "Content-Type": "application/json"
+}
+```
+
+- Timeout：`90`
+- Body：
+
+```json
+{
+  "question": "{{用户输入}}"
+}
+```
+
+如果你要做地区权限约束：
+
+```json
+{
+  "question": "{{用户输入}}",
+  "allowed_regions": ["华东", "华北"]
+}
+```
+
+## 18. 可选 systemd 部署
+
+如果你希望长期运行 `ask_service`，可以使用 systemd。
+
+参考文件：
+
+- `ask_service/systemd/ask-service.service`
+
+部署步骤：
+
+```bash
+sudo cp "$PROJECT_ROOT/ask_service/systemd/ask-service.service" \
+  /etc/systemd/system/ask-service.service
+```
+
+然后按你的机器实际情况修改：
+
+- `User`
+- `WorkingDirectory`
+- `EnvironmentFile`
+- `ExecStart`
+
+之后执行：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable ask-service
+sudo systemctl start ask-service
+sudo systemctl status ask-service
+```
+
+## 19. 推荐上线顺序
+
+建议按下面的顺序推进：
+
+1. `git clone`
+2. 安装 Python 与依赖
+3. 创建虚拟环境并安装 WrenAI
+4. 盘点 MySQL 表结构
+5. 选出第一批核心表
+6. 新建业务 Wren 项目目录
+7. 配置 `connection_info.json`
+8. 编写 `models/`
+9. 编写 `relationships.yml`
+10. 补 `knowledge/rules`
+11. 补 `knowledge/sql`
+12. 执行 `wren context validate`
+13. 执行 `wren context build`
+14. 执行 `wren memory index`
+15. 配置 `ask_service/.env`
+16. 启动 `ask_service`
+17. 测试 `/health`、`/status`、`/api/ask`
+18. 在 `AgentVerse` 中配置 HTTP 节点
+19. 用真实高频问题回归测试
+
+## 20. 多表数据库下如何保证准确率
+
+如果数据库表很多，建议这样控制准确率：
+
+- 首批只接 10 到 30 张核心表
+- 关键指标一定写进 `knowledge/rules`
+- 高频问题一定写进 `knowledge/sql`
+- 核心统计口径尽量做成 `cube`
+- 不清楚的表和字段，先不上线
+- 先做一个业务域，再逐步扩域
+
+最容易影响准确率的因素通常是：
+
+- 字段描述太少
+- 表关系写错
+- 业务口径不统一
+- 示例 SQL 太少
+- 一次性引入太多弱相关表
+
+## 21. 常见问题
+
+### 21.1 `wren context validate` 失败
+
+优先检查：
+
+- YAML 缩进
+- 字段类型是否合理
+- 主键字段是否存在
+- 关系中的模型名和字段名是否写对
+
+### 21.2 `wren memory index` 很慢
+
+原因通常是首次初始化嵌入模型。
 
 建议：
-
-- 提前设置镜像：
 
 ```bash
 export HF_ENDPOINT=https://hf-mirror.com
 ```
 
-### 8.2 `ask_service` 启动卡在 application startup
+### 21.3 `ask_service` 已启动但 `/api/ask` 返回 503
 
-原因：
+先看 `/status`：
 
-- `MemoryStore` 首次加载模型
+- 如果 `memory_state=warming_up`，说明 Memory 还在预热
+- 如果 `memory_state=error`，检查 `memory_init_error`
 
-建议：
-
-- 首次耐心等待
-- 启动完成后后续请求会快很多
-
-### 8.3 `/api/ask` 返回 `ok=false`
-
-先看：
-
-- `error.code`
-- `error.message`
-
-常见错误：
-
-- `BAD_PLAN`
-- `LLM_TIMEOUT`
-- `LLM_API_ERROR`
-- `INTERNAL_ERROR`
-
-### 8.4 问数结果不准确
+### 21.4 问数结果不准
 
 优先检查：
 
-- `models/*.yml` 字段描述是否清楚
+- `models/*.yml` 的字段描述是否足够明确
 - `relationships.yml` 是否正确
-- `knowledge/rules` 是否定义了业务口径
-- `knowledge/sql` 是否沉淀了常见正确 SQL
+- `knowledge/rules` 是否覆盖关键业务口径
+- `knowledge/sql` 是否沉淀了高频正确 SQL
 
-## 9. 推荐操作顺序
+## 22. 最终交付检查清单
 
-建议严格按下面顺序进行：
+上线前建议确认下面这些项都已完成：
 
-1. 安装 Python 依赖和 WrenAI
-2. 手工创建 `order-demo` 目录和配置文件
-3. 配置已有业务 MySQL 的连接信息
-4. 根据你的业务表编写 `models/` 和 `relationships.yml`
-5. 按需补充 `cubes/`、`knowledge/rules/`、`knowledge/sql/`
-6. 执行 `wren context validate`
-7. 执行 `wren context build`
-8. 执行 `wren memory index`
-9. 手工验证 `wren --sql`、`wren cube query`
-10. 配置并启动 `ask_service`
-11. 测试 `/health`、`/status`、`/api/ask`
-12. 在 AgentVerse 工作流中配置 HTTP 节点
-13. 用真实自然语言问题进行回归测试
+- 源码已成功 clone
+- 虚拟环境已创建
+- `WrenAI` 已安装成功
+- 新业务项目目录已创建
+- `connection_info.json` 已配置
+- `models/` 已完成第一版
+- `relationships.yml` 已完成第一版
+- `knowledge/rules` 已补充
+- `knowledge/sql` 已补充
+- `target/mdl.json` 已生成
+- `.wren/memory/` 已生成
+- `ask_service/.env` 已配置
+- `/health` 正常
+- `/status` 正常
+- `/api/ask` 可返回有效 JSON
+- `AgentVerse` HTTP 节点已配置
+- 已用真实问题做回归验证
 
-## 10. 后续优化建议
-
-当数据库表越来越多时，不建议继续完全手工维护。
-
-推荐后续演进成：
-
-- 程序生成结构
-- AI 补充语义
-- 人工确认关键业务口径
-
-也就是：
-
-```text
-MySQL schema
-  -> 自动生成 Wren 模型骨架
-  -> AI 补 description / rules / SQL examples
-  -> 人工确认 revenue / 时间字段 / 状态口径
-  -> ask_service / AgentVerse 使用
-```
-
-如果后续你准备走自动化建模路线，可以在当前目录下新增：
-
-- `tools/extract_mysql_schema.py`
-- `tools/generate_wren_structure.py`
-- `tools/enrich_wren_with_ai.py`
-
-用于批量生成和维护 Wren 项目文件。
+到这里，一个新的 `AgentVerse_WrenAI + 新业务 MySQL` 环境就部署完成了。
