@@ -830,6 +830,7 @@ def build_plan_prompt(
 3. 如果问题缺少关键条件，返回 need_clarification=true。
 4. 如果 allowed_regions 非空，你必须把地区限制在这些值内。
 5. 默认返回表格，chart.type 用 table/bar/line 之一。
+6. 如果用户问题与数据查询无关（例如闲聊、问候、常识问答、求助写作等），必须返回 need_clarification=true，并在 clarification_question 中用一句话引导用户提出具体的业务数据问题；仍然只输出 JSON，不允许输出自然语言解释。
 
 输出格式：
 {{
